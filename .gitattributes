@@ -1,0 +1,8 @@
+# Normalise line endings in the repo to LF. The working tree lives on an NTFS
+# mount under WSL, where editors on the Windows side rewrite files as CRLF; without
+# this every file they touch shows up as a whole-file diff and real changes become
+# unreviewable.
+* text=auto eol=lf
+
+# Binary caches (equity matrices) must never be line-ending converted.
+*.npy binary
