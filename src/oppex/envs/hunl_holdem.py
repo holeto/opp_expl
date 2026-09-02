@@ -44,13 +44,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from . import betting
 from .base import Env, Info, PRNGKey
+from .betting import ALL_IN, CALL, FOLD, NUM_POINT_ATOMS as _NUM_POINT_ATOMS
 
-# ── Atom layout: point actions first, then K bet atoms ───────────────────────
-FOLD = 0
-CALL = 1
-ALL_IN = 2
-_NUM_POINT_ATOMS = 3
+__all__ = ["HunlHoldem", "HunlState", "hand_rank7", "FOLD", "CALL", "ALL_IN"]
 
 # Hand-category indices for the 7-card evaluator (higher = stronger).
 _HIGH_CARD, _PAIR, _TWO_PAIR, _TRIPS, _STRAIGHT = 0, 1, 2, 3, 4
@@ -192,6 +190,7 @@ class HunlHoldem(Env):
     num_bet_bins: int = 4,
     reward_type: str = "difference",
     max_length: int | None = None,
+    drop_duplicate_allin: bool = False,
   ) -> None:
     if reward_type not in ("difference", "binary"):
       raise ValueError(f"reward_type must be 'difference' or 'binary', got '{reward_type}'")
@@ -202,11 +201,17 @@ class HunlHoldem(Env):
     self.big_blind = float(big_blind)
     self.num_bet_bins = int(num_bet_bins)
     self.max_bet_fraction = max_bet_fraction
-    self.bet_bins = jnp.linspace(
-      self.max_bet_fraction / self.num_bet_bins, self.max_bet_fraction, self.num_bet_bins
-    )
     self.reward_type = reward_type
     self._max_length = int(max_length) if max_length is not None else None
+    self._drop_duplicate_allin = bool(drop_duplicate_allin)
+    self.rules = betting.make_rules(
+      starting_stack=self.starting_stack,
+      small_blind=self.small_blind,
+      big_blind=self.big_blind,
+      max_bet_fraction=self.max_bet_fraction,
+      num_bet_bins=self.num_bet_bins,
+    )
+    self.bet_bins = self.rules.bet_bins
 
   # ── Static properties ────────────────────────────────────────────────────
 
@@ -251,29 +256,53 @@ class HunlHoldem(Env):
     hole_cards = deck[:4].reshape(2, 2).astype(jnp.int32)  # p0: 0,1  p1: 2,3
     board = deck[4:9].astype(jnp.int32)
     L = self.max_length
-    return HunlState(
+    bs = betting.initial_state(self.rules)
+    return self._from_betting(
+      bs,
       hole_cards=hole_cards,
       board=board,
-      committed=jnp.array([self.small_blind, self.big_blind], dtype=jnp.float32),
-      committed_street=jnp.array([self.small_blind, self.big_blind], dtype=jnp.float32),
-      street=jnp.int32(0),
-      cur_player=jnp.int32(0),  # SB (button) acts first pre-flop
-      acted=jnp.int32(0),
-      last_raise_size=jnp.float32(self.big_blind),  # min raise base = one BB
       action_history=jnp.full(L, -1, dtype=jnp.int32),
       bet_history=jnp.zeros(L, dtype=jnp.float32),
       step=jnp.int32(0),
-      done=jnp.bool_(False),
     )
 
   # ── Internal helpers ──────────────────────────────────────────────────────
+  # HunlState stays flat and carries the betting fields inline; these adapters
+  # pack/unpack the card-free view that `betting` operates on. Nesting a
+  # BettingState inside HunlState would be tidier but would rewrite the field
+  # layout that `_betting_features` and all six observation methods depend on,
+  # for no functional gain — the rules live in one place either way. Pure pytree
+  # plumbing, free under jit.
+
+  def _to_betting(self, state: HunlState) -> betting.BettingState:
+    return betting.BettingState(
+      committed=state.committed,
+      committed_street=state.committed_street,
+      street=state.street,
+      cur_player=state.cur_player,
+      acted=state.acted,
+      last_raise_size=state.last_raise_size,
+      done=state.done,
+    )
+
+  def _from_betting(self, bs: betting.BettingState, **carried) -> HunlState:
+    return HunlState(
+      committed=bs.committed,
+      committed_street=bs.committed_street,
+      street=bs.street,
+      cur_player=bs.cur_player,
+      acted=bs.acted,
+      last_raise_size=bs.last_raise_size,
+      done=bs.done,
+      **carried,
+    )
 
   def _stacks(self, state: HunlState) -> jax.Array:
-    return self.starting_stack - state.committed
+    return betting.stacks(self.rules, self._to_betting(state))
 
   def _call_amount(self, state: HunlState) -> jax.Array:
     """Chips the current player must add to match the street's high bet."""
-    return jnp.max(state.committed_street) - state.committed_street[state.cur_player]
+    return betting.call_amount(self.rules, self._to_betting(state))
 
   # ── Step ──────────────────────────────────────────────────────────────────
 
@@ -283,92 +312,23 @@ class HunlHoldem(Env):
     actions: jax.Array,  # (P,) atom index per player; only current_player's is read
   ) -> tuple[HunlState, jax.Array, jax.Array, Info]:
     cp = state.cur_player
-    opp = 1 - cp
     atom = actions[cp].astype(jnp.int32)
-    #Will be non-zero bet even for non-bet actions, but masked out by the where
-    bet_fraction = self.bet_bins[jnp.maximum(atom - _NUM_POINT_ATOMS, 0)]
+    out = betting.step(self.rules, self._to_betting(state), atom)
 
-    stack_cp = self.starting_stack - state.committed[cp]
-    call_amt = self._call_amount(state)
-    # Pot-relative raise: call first, then add `fraction` of the pot as it stands
-    # *after* that call. fraction == 1 is therefore a pot-sized raise. Measuring
-    # against the pot (not the call) keeps the bins distinct on an unraised
-    # street, where call_amt == 0 would collapse every bet atom to a min raise.
-    pot_after_call = state.committed.sum() + call_amt
-    raw_bet = call_amt + bet_fraction * pot_after_call
-    old_max = jnp.max(state.committed_street)
-
-    is_fold = atom == FOLD
-
-    # Smallest legal raise: match the call, then add at least one min-raise unit,
-    # capped by the stack (so it collapses to an all-in when the stack is short).
-    min_raise_add = jnp.minimum(call_amt + state.last_raise_size, stack_cp)
-    bet_add = jnp.clip(jnp.round(raw_bet), min_raise_add, stack_cp)
-
-    added = jnp.where(
-      is_fold, 0.0,
-      jnp.where(atom == CALL, jnp.minimum(call_amt, stack_cp),
-      jnp.where(atom == ALL_IN, stack_cp, bet_add)))
-
-    new_committed = state.committed.at[cp].add(added)
-    new_committed_street = state.committed_street.at[cp].add(added)
-    new_all_in = (self.starting_stack - new_committed) <= 0.0
-
-    # A raise/bet pushes the street bet above the previous high → opponent owes.
-    raised = new_committed_street[cp] > old_max
-    raise_increment = new_committed_street[cp] - old_max
-    new_last_raise = jnp.where(
-      raised, jnp.maximum(raise_increment, self.big_blind), state.last_raise_size
-    )
-
-    acted_new = state.acted + jnp.where(is_fold, 0, 1)
-    matched = new_committed_street[0] == new_committed_street[1]
-    either_all_in = new_all_in[0] | new_all_in[1]
-    # Betting closes when both have matched (and each has acted), or a player is
-    # all-in with nothing left to contest — including a call all-in for less.
-    called_all_in_short = (~raised) & (~is_fold) & new_all_in[cp] & (~matched)
-    round_over = (
-      is_fold
-      | ((matched | (either_all_in & ~raised)) & (acted_new >= 2))
-      | called_all_in_short
-    )
-
-    # Hand ends on a fold, at showdown after the river, or once all-in is settled.
-    showdown = round_over & (~is_fold) & (either_all_in | (state.street == 3))
-    done = is_fold | showdown
-
-    # Advance to the next street when the round closes without ending the hand.
-    advance = round_over & (~done)
-    next_street = state.street + jnp.where(advance, 1, 0)
-    next_committed_street = jnp.where(advance, jnp.zeros(2, jnp.float32), new_committed_street)
-    # Post-flop the big blind (player 1) acts first; within a street the turn passes.
-    next_player = jnp.where(advance, jnp.int32(1), jnp.where(round_over, cp, opp))
-    next_acted = jnp.where(advance, jnp.int32(0), acted_new)
-    next_last_raise = jnp.where(advance, jnp.float32(self.big_blind), new_last_raise)
-
-    new_history = state.action_history.at[state.step].set(atom)
-    new_bets = state.bet_history.at[state.step].set(added)
-
-    new_state = HunlState(
+    new_state = self._from_betting(
+      out.state,
       hole_cards=state.hole_cards,
       board=state.board,
-      committed=new_committed,
-      committed_street=next_committed_street,
-      street=next_street,
-      cur_player=next_player,
-      acted=next_acted,
-      last_raise_size=next_last_raise,
-      action_history=new_history,
-      bet_history=new_bets,
+      action_history=state.action_history.at[state.step].set(atom),
+      bet_history=state.bet_history.at[state.step].set(out.added),
       step=state.step + 1,
-      done=done,
     )
 
     rewards = jnp.where(
-      done, self._terminal_rewards(state, new_committed, cp, is_fold),
+      out.done, self._terminal_rewards(state, out.state.committed, cp, out.is_fold),
       jnp.zeros(2, jnp.float32),
     )
-    return new_state, rewards, done, {}
+    return new_state, rewards, out.done, {}
 
   def _terminal_rewards(
     self, state: HunlState, committed: jax.Array, folder: jax.Array, is_fold: jax.Array
@@ -379,20 +339,11 @@ class HunlHoldem(Env):
     starting stack into [-1, 1]: the most a player can win is the opponent's
     whole stack, so ``profit / starting_stack`` is bounded by ±1.
     """
-    # Fold: the folder forfeits; the opponent wins the folder's contribution.
-    fold_winner = 1 - folder
-    fold_r = jnp.where(
-      fold_winner == 0,
-      jnp.stack([committed[1], -committed[1]]),
-      jnp.stack([-committed[0], committed[0]]),
-    )
+    fold_r = betting.fold_payoffs(committed, folder)
 
     r0 = hand_rank7(jnp.concatenate([state.hole_cards[0], state.board]))
     r1 = hand_rank7(jnp.concatenate([state.hole_cards[1], state.board]))
-    show_r = jnp.where(
-      r0 > r1, jnp.stack([committed[1], -committed[1]]),
-      jnp.where(r1 > r0, jnp.stack([-committed[0], committed[0]]),
-      jnp.zeros(2, jnp.float32)))
+    show_r = betting.showdown_payoffs(committed, jnp.sign(r0 - r1))
 
     raw = jnp.where(is_fold, fold_r, show_r)
     if self.reward_type == "binary":
@@ -413,18 +364,10 @@ class HunlHoldem(Env):
       still has chips to face it (no raising an already all-in opponent).
     """
     is_active = jnp.int32(player_id) == state.cur_player
-    cp = state.cur_player
-    stack_cp = self.starting_stack - state.committed[cp]
-    opp_stack = self.starting_stack - state.committed[1 - cp]
-    call_amt = self._call_amount(state)
-
-    can_fold = call_amt > 0.0
-    can_all_in = stack_cp > 0.0
-    can_raise = (stack_cp >= call_amt + state.last_raise_size) & (opp_stack > 0.0)
-
-    bet_slots = jnp.full(self.num_bet_bins, can_raise)
-    active_mask = jnp.concatenate(
-      [jnp.array([can_fold, True, can_all_in]), bet_slots]
+    active_mask = betting.legal_atoms(
+      self.rules,
+      self._to_betting(state),
+      drop_duplicate_allin=self._drop_duplicate_allin,
     )
     inactive_mask = jnp.zeros(self.num_actions, dtype=bool).at[0].set(True)
     return jnp.where(is_active, active_mask, inactive_mask)
