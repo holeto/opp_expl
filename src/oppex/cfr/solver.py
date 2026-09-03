@@ -61,27 +61,24 @@ def legal_mask(tree: PreflopTree) -> jax.Array:
 # ── Strategy ─────────────────────────────────────────────────────────────────
 
 
-def regret_matching(regret: jax.Array, legal: jax.Array) -> jax.Array:
-  """Positive-regret proportions, uniform over legal actions where none are positive.
-
-  The divisor is guarded, not the result: ``jnp.where`` evaluates both branches,
-  so ``pos / denom`` with ``denom == 0`` produces a NaN that survives the select.
-  That happens on iteration 1 at every node whose regrets are all zero.
+def regret_matching_plus(regret: jax.Array, legal: jax.Array) -> jax.Array:
+  """ Update the strategy with RM+ rule, e.g. the probability
+  of each action proportional to the cumulative positive regret
   """
   legal_b = legal[:, None, :]
   pos = jnp.where(legal_b, jnp.maximum(regret, 0.0), 0.0)
   denom = pos.sum(-1, keepdims=True)
-  safe = jnp.where(denom > 0.0, denom, 1.0)
+  safe = denom + (denom == 0)
   uniform = legal_b / legal.sum(-1)[:, None, None]
   return jnp.where(denom > 0.0, pos / safe, uniform).astype(regret.dtype)
 
 
 def average_strategy(tables: Tables, legal: jax.Array) -> jax.Array:
-  """Reach-weighted average strategy — the thing that converges to equilibrium."""
+  """"""
   legal_b = legal[:, None, :]
   ssum = jnp.where(legal_b, tables.strategy_sum, 0.0)
   denom = ssum.sum(-1, keepdims=True)
-  safe = jnp.where(denom > 0.0, denom, 1.0)
+  safe = denom + (denom == 0)
   uniform = legal_b / legal.sum(-1)[:, None, None]
   return jnp.where(denom > 0.0, ssum / safe, uniform).astype(ssum.dtype)
 
@@ -95,12 +92,7 @@ def terminal_cfv(const, stake, r_opp, player, ev, mask=MASK):
   ``const`` is a hand-independent chip payoff to player 0 (fold terminals);
   ``stake`` multiplies the net-EV matrix (showdown and checkdown terminals).
 
-  Both terms carry the mask. It is tempting to write a fold terminal as
-  ``const * r_opp.sum()`` since the payoff does not depend on cards — that is
-  wrong. The mask is not about the payoff, it is about which opponent hands are
-  *possible* given yours. With a uniform opponent range the two differ by a flat
-  1225/1326 and look identical after regret matching; the error only appears,
-  hand-dependently, once ranges sharpen.
+  Make sure to use the mask to mask out invalid opponent cards.
   """
   out = jnp.zeros_like(r_opp)
   if const != 0.0:
@@ -161,7 +153,7 @@ def _traverse(tree, sigma, ev, r0, r1):
 
 def cfr_iteration(tree, tables: Tables, legal, ev, n_hands, *, plus=False, linear=False):
   """One simultaneous-update CFR iteration over all hands at once."""
-  sigma = regret_matching(tables.regret, legal)
+  sigma = regret_matching_plus(tables.regret, legal)
   ones = jnp.ones(n_hands, tables.regret.dtype)
   _, _, node_cfv, node_reach = _traverse(tree, sigma, ev, ones, ones)
 
@@ -194,11 +186,7 @@ def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32):
 
 
 def check_zero_sum(tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32):
-  """``r0 · cfv0(n) + r1 · cfv1(n) == 0`` at every node, including the root.
-
-  One assertion covering a lot of ground: it fails if the opponent's branch sum
-  is sigma-weighted, if a terminal's sign is flipped, or if the mask is dropped
-  on one player's side but not the other.
+  """``Check whether r0 · cfv0(n) + r1 · cfv1(n) == 0`` at every node, including the root.
   """
   ones = jnp.ones(n_hands, dtype)
   cfv0, cfv1, node_cfv, node_reach = _traverse(tree, sigma, ev, ones, ones)
@@ -215,16 +203,10 @@ def check_zero_sum(tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32):
 
 
 def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
-  """``Σ_terminals r0(z)[a] * r1(z)[b] == 1`` for every hand pair ``(a, b)``.
+  """``Σ_terminals r0(z)[a] * r1(z)[b] * rc(z)[a, b] == 1`` for every hand pair ``(a, b)``.
 
-  Proves the tree is a proper probability tree and that traversal visits every
-  leaf exactly once.
-
-  Note this is the *joint* reach. The per-player version — each player's own
-  reach summing to 1 over terminals — is **false**, and attractively so: at a
-  node owned by player 1, every branch carries the same ``r0``, so summing
-  ``r0`` over terminals counts it once per opponent continuation. Only the
-  product telescopes back to 1.
+  Checks whether the joint reaches form a valid probability
+  distribution over terminals
   """
   total = jnp.zeros((n_hands, n_hands), dtype)
 

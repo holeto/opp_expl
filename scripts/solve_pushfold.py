@@ -69,7 +69,10 @@ def main():
 
   # ── Exact LP reference ─────────────────────────────────────────────────────
   if args.limp:
-    print("\nLP reference skipped: it solves the shove-fold game, not the limp tree.")
+    print("\nLP reference skipped. It solves a matrix game (one move each), which is")
+    print("what --limp removes: with the limp allowed the SB acts twice on the")
+    print("CALL -> BB shove -> CALL/FOLD line, and no LP of that shape applies.")
+    print("Validating the limp tree exactly would need a sequence-form LP.")
     return
 
   print("\nSolving the same game exactly by LP…")

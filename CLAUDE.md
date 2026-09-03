@@ -185,6 +185,15 @@ game (`EV = 0`, equilibrium computable by hand) → the exact LP in `lp_referenc
 which shares the equity matrix with CFR so a disagreement is a solver bug rather
 than sampling noise → published charts last.
 
+**Know what the LP does and does not cover.** It solves a *matrix game* — one move
+per player — which is exactly the `allow_limp=False` tree. It is not a sequence-form
+LP, so it cannot be pointed at `allow_limp=True`, where the SB acts twice on the
+`CALL → BB shove → CALL/FOLD` line and the value stops being bilinear in per-hand
+action probabilities. `allow_limp=False` *deletes* the limp action (`legal[CALL] =
+False` at the root) rather than assigning it a payoff. So multi-level traversal is
+currently checked only by the structural invariants, never against an exact
+reference; a sequence-form LP (cheapest on a small synthetic deck) would close that.
+
 ### Env construction
 
 [envs/\_\_init\_\_.py](src/oppex/envs/__init__.py) holds a name→class `_REGISTRY` and

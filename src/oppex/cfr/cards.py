@@ -8,19 +8,13 @@ your opponent cannot hold, so their hand distribution is conditioned on yours: i
 you hold AsAh, only one AA combination is left to them (AdAc) rather than six —
 a 5.5x difference on a quantity that decides whether calling a shove is correct.
 
-``MASK[a, b]`` is 1.0 exactly when hands ``a`` and ``b`` are disjoint, and that
-matrix is where card removal lives. It belongs in **terminal evaluation only** —
+``MASK[a, b]`` is 1.0 exactly when hands ``a`` and ``b`` are disjoint. It belongs in **terminal evaluation only** —
 never in reach propagation, where ``r_i[h]`` is player *i*'s own action-probability
 product and carries no dependence on the opponent's holding. Masking during
 propagation double-counts removal and converges to the wrong fixed point.
 
-The trap worth naming: at a fold terminal the payoff is a constant ``c``, which
-makes ``c * r_opp.sum()`` look obviously right. It is not — it must be
-``c * (MASK @ r_opp)``. The mask is not about the payoff, it is about which
-opponent hands are *possible* given yours. With a uniform opponent range the two
-differ by a flat 1225/1326, so iteration 1 is numerically identical (regret
-matching is scale-invariant) and the error only appears — hand-dependently, and
-growing as the strategy sharpens — from iteration 2 on.
+At a terminal node make sure to have the chance constant as 
+``c * (MASK @ r_opp)` rather than ``c * r_opp.sum()``.
 
 Card encoding matches ``oppex.envs.hunl_holdem``: index ``c`` in ``0..51`` decodes
 to ``rank = c // 4`` (0=2 … 12=A) and ``suit = c % 4``.
@@ -78,7 +72,7 @@ MASK = jnp.asarray(MASK_NP)          # (1326, 1326) float32, 1.0 iff disjoint
 INCIDENCE = jnp.asarray(_INCIDENCE.astype(np.float32))
 
 
-def masked_sum(r: jnp.ndarray) -> jnp.ndarray:
+def masked_sum(r: jnp.Array) -> jnp.Array:
   """``MASK @ r`` by inclusion–exclusion — an independent derivation, for tests.
 
   Subtract, from the unconditional total, the mass of every opponent hand using
