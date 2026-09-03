@@ -5,32 +5,42 @@ acts (at most) once, so the little blind cannot CALL at the root, only
 ALL_IN or FOLD. After that, the player big blind player responds accordingly.
 Sanity check for minimal PSCFR
 
-**Why this is not the textbook matrix-game LP**, ``max V s.t. V <= Σ_a σ(a) u(·,a)``
-with one constraint per opponent pure strategy. Both players here have private
-information: 1326 types with 2 actions each, so an opponent *pure strategy* is a
-map from hands to actions — 2^1326 of them, and that many constraints cannot be
-written down.
+Sequence form LP for the 2 step game.
 
-What makes it tractable is that a player's strategy space is a **product of
-per-type simplices** — the box ``[0,1]^1326``, not a simplex — and the payoff is
-bilinear. The inner minimisation therefore separates coordinate-wise: each ``y_b``
-independently minimises a linear function. So the single scalar ``V`` splits into a
-sum of per-type values ``Σ_b t_b``, and the constraints collapse from one per
-opponent pure strategy to **two per opponent type** (one per action available to
-that type). That is exactly the standard construction, indexed by (type, action)
-rather than by pure strategy.
+**Where the sequence-form equalities went.** Sequence form requires, per infoset
+``I``, ``Σ_{a ∈ A(I)} r(σ_I·a) = r(σ_I)``. Neither player's constraints appear as
+explicit ``A_eq`` rows below, because at depth 1 both discharge in closed form.
+Both are verified to hold exactly (see the checks in ``scripts/``).
 
-Note there is deliberately no ``Σ_a x_a = 1``: ``x_a`` is P(shove | hand a), an
-independent probability per hand, so the feasible set is a hypercube. Normalising
-across hands would assert the small blind shoves one hand's worth in total.
+The right-hand side is ``r(σ_I)``, **not** the chance probability of reaching ``I``:
+a realisation plan is conditional on the player's own choices, since chance and the
+opponent decide which infoset is reached and the player cannot influence that.
+Chance therefore lives in the objective coefficients — the ``sb/N_HANDS`` and
+``1/N_DEALS`` below — never in the constraints.
 
-Equivalently this **is** a sequence-form LP at depth 1. The small blind's sequences
-are ``(a, shove)`` and ``(a, fold)`` with realisation constraint
-``r(a,shove) + r(a,fold) = P(a)``; eliminating ``r(a,fold)`` is free when a type has
-two actions, and produces the constant ``-sb`` offset in the returned value. The
-limp line defeats that elimination: the small blind then has ``(a, limp, call)`` and
-``(a, limp, fold)`` summing to ``r(a, limp)`` — a variable rather than a constant —
-so the feasible set is no longer a box and explicit sequence form is required.
+*Small blind — eliminated in the primal.* Infoset "I hold ``a``" is reached by the
+empty sequence, so ``r(a,ALL_IN) + r(a,FOLD) = r(∅) = 1``. Two actions and a
+*constant* right-hand side let the equality substitute out: ``x_a = r(a,ALL_IN)``
+and ``r(a,FOLD) = 1 - x_a``. What survives is exactly the two non-negativity
+conditions, which is what ``bounds = (0, 1)`` encodes — and that substitution is
+where the constant ``-sb`` offset in the returned value comes from.
+
+*Big blind — implicit in the dual.* They get no primal variables; their
+minimisation is done analytically, and ``t_b`` with its two ``<=`` rows is the
+hypograph of ``t_b = min(fold branch, call branch)``. Their equality reappears as
+dual stationarity in ``t_b``:
+
+    lambda_fold[b] + lambda_call[b] = (objective coefficient of t_b) = 1/N_DEALS
+
+Scaling by ``N_DEALS`` gives ``r(b,FOLD) + r(b,CALL) = 1``. That is why their
+strategy is read from the duals rather than from which bound is tight.
+
+**Both shortcuts need two actions per infoset AND a constant parent realisation**,
+which is exactly what "each player acts at most once" buys. The limp line destroys
+it: the small blind then owns a second infoset with
+``r(a,limp,CALL) + r(a,limp,FOLD) = r(a,limp)`` — a *variable* right-hand side, so
+nothing substitutes out, the feasible set stops being a box, and the equalities
+must be written explicitly.
 """
 
 from __future__ import annotations
@@ -74,7 +84,7 @@ def solve_shove_fold(
     #All values have uniform chance reach in the deal options
     np.full(N_HANDS, -1.0 / N_DEALS),
   ])
-  #First strategies (as pbt )
+  #First sequence probabilities (in this case, just a standard pbt distribution)
   bounds = [(0.0, 1.0)] * N_HANDS + [(None, None)] * N_HANDS
 
   res = linprog(c, A_ub=a_ub, b_ub=b_ub, bounds=bounds, method=method)
@@ -96,7 +106,10 @@ def solve_shove_fold(
   d_fold, d_call = duals[:N_HANDS], duals[N_HANDS:]
   total = d_fold + d_call
   y = np.divide(d_call, total, out=np.zeros(N_HANDS), where=total > 1e-15)
-  return float(value), x, np.clip(y, 0.0, 1.0)
+  y = np.clip(y, 0.0, 1.0)
+
+  check_sequence_form(res, x, y)
+  return float(value), x, y
 
 
 def check_against_cfr(lp_value, br0, br1, tol=1e-3):
@@ -104,3 +117,24 @@ def check_against_cfr(lp_value, br0, br1, tol=1e-3):
   assert br0 >= lp_value - tol, f"BR0 {br0:.6f} below LP value {lp_value:.6f}"
   assert -br1 <= lp_value + tol, f"-BR1 {-br1:.6f} above LP value {lp_value:.6f}"
   return True
+
+
+def check_sequence_form(res, x, y, tol=1e-9) -> dict:
+  """Assert both players' sequence-form equalities, which are implicit above.
+
+  Neither is an ``A_eq`` row, so without this they are a claim in a docstring
+  rather than a property of the solution. Returns the residuals.
+  """
+  # Small blind: r(a,ALL_IN) + r(a,FOLD) = 1, with r(a,FOLD) := 1 - x_a.
+  sb_res = float(np.abs(x + (1.0 - x) - 1.0).max())
+  assert sb_res <= tol, f"SB realisation does not sum to 1 (max {sb_res:.3e})"
+  assert x.min() >= -tol and x.max() <= 1.0 + tol, "SB realisation outside [0, 1]"
+
+  # Big blind: dual stationarity in t_b forces the multipliers to sum to t_b's
+  # objective coefficient, which is 1/N_DEALS. Scaled up, that is their equality.
+  duals = -np.asarray(res.ineqlin.marginals)
+  total = duals[:N_HANDS] + duals[N_HANDS:]
+  bb_res = float(np.abs(total * N_DEALS - 1.0).max())
+  assert bb_res <= 1e-6, f"BB realisation does not sum to 1 (max {bb_res:.3e})"
+  assert y.min() >= -tol and y.max() <= 1.0 + tol, "BB realisation outside [0, 1]"
+  return {"sb_residual": sb_res, "bb_residual": bb_res}
