@@ -84,16 +84,6 @@ def _mc_boards(rng, n):
   return np.argsort(rng.random((n, 52)), axis=1)[:, :5].astype(np.int32)
 
 
-def _exact_board_chunks(chunk):
-  """All C(52,5) boards, in chunks."""
-  it = itertools.combinations(range(52), 5)
-  while True:
-    block = list(itertools.islice(it, chunk))
-    if not block:
-      return
-    yield np.asarray(block, dtype=np.int32)
-
-
 # ── Public entry point ───────────────────────────────────────────────────────
 
 
@@ -106,13 +96,19 @@ def preflop_ev_matrix(
   cache_dir: Path | None = None,
   progress: bool = True,
   use_cache: bool = True,
+  checkpoint_every: int = 20_000,
 ) -> jax.Array:
   """(1326, 1326) float32 net-EV matrix, antisymmetric and mask-folded.
 
-  ``exact=True`` enumerates every board (slow, no estimator error);
-  otherwise ``n_boards`` are sampled. Results are cached to ``.npy`` beside a
-  JSON sidecar recording the hand-index convention — a cache built under a
-  different convention is refused rather than silently misinterpreted.
+  ``exact=True`` enumerates every board (~4h; no estimator error); otherwise
+  ``n_boards`` are sampled. Results are cached to ``.npy`` beside a JSON sidecar
+  recording the hand-index convention — a cache built under a different
+  convention is refused rather than silently misinterpreted.
+
+  Long runs checkpoint the raw accumulators every ``checkpoint_every`` boards and
+  resume from them, so an interrupted build costs minutes rather than restarting.
+  Board generation is deterministic in both modes, so resuming just means
+  skipping the boards already folded in.
   """
   path, meta_path = _cache_paths(n_boards, seed, exact, cache_dir)
   if use_cache and path.exists():
@@ -120,26 +116,30 @@ def preflop_ev_matrix(
     if cached is not None:
       return jnp.asarray(cached)
 
-  s = jnp.zeros((N_HANDS, N_HANDS), jnp.int32)
-  c = jnp.zeros((N_HANDS, N_HANDS), jnp.int32)
+  total = N_BOARDS_EXACT if exact else int(n_boards)
+  ckpt_path = path.with_suffix(".ckpt.npz")
+  s, c, done = _load_checkpoint(ckpt_path, progress)
+  if done >= total:
+    done, s, c = 0, None, None       # a checkpoint for a longer run is not reusable
+  if s is None:
+    s = jnp.zeros((N_HANDS, N_HANDS), jnp.int32)
+    c = jnp.zeros((N_HANDS, N_HANDS), jnp.int32)
 
-  if exact:
-    total, chunks = N_BOARDS_EXACT, _exact_board_chunks(chunk)
-  else:
-    rng = np.random.default_rng(seed)
-    total = int(n_boards)
-    chunks = (
-      _mc_boards(rng, min(chunk, total - i)) for i in range(0, total, chunk)
-    )
+  chunks = _board_chunks(exact, total, seed, chunk, skip=done)
 
-  done, t0 = 0, time.time()
+  t0, start, since_ckpt = time.time(), done, 0
   for block in chunks:
     s, c = _accumulate((s, c), jnp.asarray(block))
     done += len(block)
-    if progress and (done % (chunk * 40) == 0 or done >= total):
+    since_ckpt += len(block)
+    if since_ckpt >= checkpoint_every and done < total:
+      _save_checkpoint(ckpt_path, s, c, done)
+      since_ckpt = 0
+    if progress and (done % (chunk * 40) < chunk or done >= total):
       el = time.time() - t0
-      print(f"  {done:>9,}/{total:,} boards  {el:6.1f}s elapsed  "
-            f"{el / done * (total - done):6.1f}s left", flush=True)
+      eta = el / max(done - start, 1) * (total - done)
+      print(f"  {done:>9,}/{total:,} boards  {el / 60:6.1f} min elapsed  "
+            f"{eta / 60:6.1f} min left", flush=True)
 
   c_np, s_np = np.asarray(c), np.asarray(s)
   ev = np.zeros((N_HANDS, N_HANDS), np.float32)
@@ -149,7 +149,48 @@ def preflop_ev_matrix(
   _validate(ev, c_np, exact)
   if use_cache:
     _save_cache(path, meta_path, ev, n_boards, seed, exact)
+    ckpt_path.unlink(missing_ok=True)
   return jnp.asarray(ev)
+
+
+def _board_chunks(exact, total, seed, chunk, skip=0):
+  """Deterministic board stream, resuming past the first ``skip`` boards."""
+  if exact:
+    it = itertools.combinations(range(52), 5)
+    if skip:
+      next(itertools.islice(it, skip, skip), None)
+    while True:
+      block = list(itertools.islice(it, chunk))
+      if not block:
+        return
+      yield np.asarray(block, dtype=np.int32)
+  else:
+    rng = np.random.default_rng(seed)
+    if skip:                      # advance the stream, cheap next to the equity work
+      for i in range(0, skip, chunk):
+        _mc_boards(rng, min(chunk, skip - i))
+    for i in range(skip, total, chunk):
+      yield _mc_boards(rng, min(chunk, total - i))
+
+
+def _load_checkpoint(ckpt_path, progress):
+  if not ckpt_path.exists():
+    return None, None, 0
+  try:
+    z = np.load(ckpt_path)
+    done = int(z["done"])
+    if progress:
+      print(f"  resuming from checkpoint at {done:,} boards", flush=True)
+    return jnp.asarray(z["s"]), jnp.asarray(z["c"]), done
+  except Exception as e:                              # corrupt/partial write
+    print(f"  ignoring unreadable checkpoint {ckpt_path.name}: {e}")
+    return None, None, 0
+
+
+def _save_checkpoint(ckpt_path, s, c, done):
+  tmp = ckpt_path.with_suffix(".tmp.npz")
+  np.savez(tmp, s=np.asarray(s), c=np.asarray(c), done=done)
+  tmp.replace(ckpt_path)          # atomic: never leave a half-written checkpoint
 
 
 # ── Validation ───────────────────────────────────────────────────────────────
