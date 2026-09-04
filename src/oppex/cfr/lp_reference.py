@@ -1,5 +1,8 @@
 """Exact Nash solution of the shove-fold game by linear programming.
 
+Works ONLY for the pre-flop game, where the only allowed
+actions are FOLD or ALL_IN (shove)
+
 The shove-fold game is a minimal poker game, where each player only
 acts (at most) once, so the little blind cannot CALL at the root, only
 ALL_IN or FOLD. After that, the player big blind player responds accordingly.
@@ -86,7 +89,6 @@ def solve_shove_fold(
   ])
   #First sequence probabilities (in this case, just a standard pbt distribution)
   bounds = [(0.0, 1.0)] * N_HANDS + [(None, None)] * N_HANDS
-  breakpoint()
 
   res = linprog(c, A_ub=a_ub, b_ub=b_ub, bounds=bounds, method=method)
   if not res.success:

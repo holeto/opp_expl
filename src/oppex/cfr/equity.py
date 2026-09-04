@@ -94,10 +94,17 @@ def _accumulate(carry, boards):
     )(_HAND_CARDS_J)                                              # (1326,) int32
     # A hand is unusable against a board that contains either of its cards. Such
     # hands still produce a finite (meaningless) score, so the mask, not the
-    # evaluator, is what keeps them out.
+    # evaluator, is what keeps them out. Made since
+    # the sampling can produce repeated hands
+    #[1326]
     valid = ~(_HAND_CARDS_J[:, :, None] == board[None, None, :]).any(axis=(1, 2))
+    #[1326, 1326]
     vv = valid[:, None] & valid[None, :]
     sgn = jnp.sign(ranks[:, None] - ranks[None, :]).astype(jnp.int32)
+    #S counts the total boards where
+    # row hand won against the collumn hand, 
+    # while c counts the total number of valid
+    # boards seen by the row hand/collumn hand pair.
     return (s + jnp.where(vv, sgn, 0), c + vv.astype(jnp.int32)), None
 
   (s, c), _ = jax.lax.scan(one, carry, boards)
@@ -124,6 +131,8 @@ def preflop_ev_matrix(
   checkpoint_every: int = 20_000,
 ) -> jax.Array:
   """(1326, 1326) float32 net-EV matrix, antisymmetric and mask-folded.
+  An expected value matrix for each hand pair, for each 
+  potential follow up board. 
 
   ``exact=True`` enumerates every board (~4h; no estimator error); otherwise
   ``n_boards`` are sampled. Results are cached to ``.npy`` beside a JSON sidecar
@@ -170,6 +179,9 @@ def preflop_ev_matrix(
   c_np, s_np = np.asarray(c), np.asarray(s)
   ev = np.zeros((N_HANDS, N_HANDS), np.float32)
   np.divide(s_np, c_np, out=ev, where=c_np > 0)
+  #The final matrix was also computed
+  # for two hands that can never occur together
+  # Mask it out.
   ev *= MASK_NP
 
   _validate(ev, c_np, exact)

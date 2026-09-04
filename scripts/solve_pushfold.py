@@ -15,7 +15,7 @@ import time
 import jax.numpy as jnp
 import numpy as np
 
-from oppex.cfr import equity, exploit, lp_reference, report, solver, tree
+from oppex.cfr import equity, exploit, lp_reference, report, seqform, solver, tree
 from oppex.cfr.cards import N_HANDS
 from oppex.envs import betting
 
@@ -27,6 +27,7 @@ def main():
   ap.add_argument("--boards", type=int, default=200_000)
   ap.add_argument("--exact-equity", action="store_true")
   ap.add_argument("--limp", action="store_true", help="allow the limp (NOT chart-comparable)")
+  ap.add_argument("--no-lp", action="store_true", help="skip the exact LP reference")
   args = ap.parse_args()
 
 
@@ -39,12 +40,6 @@ def main():
   ev = equity.preflop_ev_matrix(
     n_boards=args.boards, exact=args.exact_equity, progress=True
   )
-  print("\nSolving the same game exactly by LP…")
-  t0 = time.time()
-  lp_v, lp_x, lp_y = lp_reference.solve_shove_fold(
-    np.asarray(ev), small_blind=small_blind, big_blind=big_blind, stake=stack
-  )
-  print(f"  solved in {time.time() - t0:.1f}s")
   rules = betting.make_rules(stack, small_blind, big_blind, 2.0, 0)
   tr = tree.build_preflop_tree(rules, allow_limp=args.limp)
   legal = solver.legal_mask(tr)
@@ -75,31 +70,51 @@ def main():
   print(f"\nInvariants: zero-sum {zs:.2e} | joint reach {rc:.2e} "
         f"| v0+v1 {float(v0 + v1):+.2e}")
 
-  # ── Exact LP reference ─────────────────────────────────────────────────────
-  if args.limp:
-    print("\nLP reference skipped. It solves a matrix game (one move each), which is")
-    print("what --limp removes: with the limp allowed the SB acts twice on the")
-    print("CALL -> BB shove -> CALL/FOLD line, and no LP of that shape applies.")
-    print("Validating the limp tree exactly would need a sequence-form LP.")
+  # ── Exact reference: sequence-form LP ──────────────────────────────────────
+  # The sequence-form LP is the reference because it is built straight off the
+  # tree, with every realisation constraint written out, and so applies to any
+  # tree shape — including --limp, where a player acts twice.
+  if args.no_lp:
     return
-
-
-  ALL_IN, CALL = betting.ALL_IN, betting.CALL
-  cfr_x = np.asarray(avg[0][:, ALL_IN])
-  cfr_y = np.asarray(avg[1][:, CALL])
+  print("\nSolving the same tree exactly by sequence-form LP…")
+  t0 = time.time()
+  lp_v, r0, r1, sf = seqform.solve(tr, np.asarray(ev), N_HANDS)
+  print(f"  solved in {time.time() - t0:.1f}s "
+        f"(SB sequences {sf.n_seq[0]}, BB sequences {sf.n_seq[1]})")
+  lp_sig0 = seqform.behaviour_strategy(tr, sf, r0, 0)
+  lp_sig1 = seqform.behaviour_strategy(tr, sf, r1, 1)
 
   print(f"\n{'':22s}{'CFR':>12s}{'LP (exact)':>12s}{'diff':>10s}")
   print(f"  {'value to SB (bb)':20s}{float(v0) / big_blind:>12.5f}"
         f"{lp_v / big_blind:>12.5f}{abs(float(v0) - lp_v) / big_blind:>10.2e}")
-  print(f"  {'SB shove freq':20s}{cfr_x.mean():>12.5f}{lp_x.mean():>12.5f}"
-        f"{abs(cfr_x.mean() - lp_x.mean()):>10.2e}")
-  print(f"  {'BB call freq':20s}{cfr_y.mean():>12.5f}{lp_y.mean():>12.5f}"
-        f"{abs(cfr_y.mean() - lp_y.mean()):>10.2e}")
+  for i, node in enumerate(tr.nodes):
+    sig = lp_sig0.get(i, lp_sig1.get(i))
+    for a in (a for a, c in enumerate(node.child) if c is not None):
+      cfr_f, lp_f = float(np.asarray(avg[i])[:, a].mean()), float(sig[:, a].mean())
+      name = {0: "FOLD", 1: "CALL", 2: "ALL_IN"}.get(a, f"BET_{a - 3}")
+      print(f"  n{i} P{node.player} {name:<14s}{cfr_f:>12.5f}{lp_f:>12.5f}"
+            f"{abs(cfr_f - lp_f):>10.2e}")
 
   lp_reference.check_against_cfr(lp_v, br0 * big_blind, br1 * big_blind)
   print(f"\n  LP sandwich BR0 >= v >= -BR1 holds "
         f"({br0 * big_blind:+.5f} >= {lp_v:+.5f} >= {-br1 * big_blind:+.5f})")
   print(f"  exploitability: {e:.3e} bb/hand")
+
+  # Cross-check the compact hand-derived LP against sequence form. Two
+  # independent formulations of the same game: agreement is strong evidence that
+  # neither derivation is wrong. Only valid without the limp.
+  if not args.limp:
+    cv, cx, cy = lp_reference.solve_shove_fold(
+      np.asarray(ev), small_blind=small_blind, big_blind=big_blind, stake=stack
+    )
+    sq_x = lp_sig0[0][:, betting.ALL_IN]
+    sq_y = lp_sig1[1][:, betting.CALL]
+    print(f"\n  compact LP agrees with sequence form: value {abs(cv - lp_v):.2e}, "
+          f"shove {np.abs(cx - sq_x).max():.2e}, call {np.abs(cy - sq_y).max():.2e}")
+
+  ALL_IN, CALL = betting.ALL_IN, betting.CALL
+  cfr_x = np.asarray(avg[0][:, ALL_IN])
+  cfr_y = np.asarray(avg[1][:, CALL]) if not args.limp else np.asarray(avg[3][:, CALL])
 
   # ── Charts ─────────────────────────────────────────────────────────────────
   print()
