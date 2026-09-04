@@ -8,11 +8,20 @@ runout:
 
 Stored as **net EV** (``win% - lose%``, ties contributing 0) rather than equity,
 because net EV *is* the payoff per unit stake: a showdown for ``S`` chips pays
-``S * EV[a, b]`` to player 0 directly. Two properties follow and both are load-
-bearing. It is antisymmetric (``EV.T == -EV``), which is a free exactness check
-and lets the solver's terminal operator collapse to two matrix-vector products.
-And it is stored **already multiplied by the card-removal mask**, so a showdown
-terminal cannot silently forget removal.
+``S * EV[a, b]`` to player 0 directly, with no conversion at the use site. Two
+properties follow and both are load-bearing. It is antisymmetric
+(``EV.T == -EV``), which is a free exactness check and lets the solver's terminal
+operator collapse to two matrix-vector products. And it is stored **already
+multiplied by the card-removal mask**, so a showdown terminal cannot silently
+forget removal.
+
+*These are expectations, not outcomes — entries are nowhere near ±1.* The ±1
+"row hand beats column hand" matrix is ``sgn`` inside ``_accumulate``, and it is
+defined only for one **specific** board; ``EV`` is the mean of 1.7M such matrices.
+Preflop no board exists yet, so ±1 would mean winning on every single runout:
+across all 1.6M valid pairs the largest is KdKs vs Kh2d at 0.8998, and none exceed
+0.95. Decode with ``equity = (EV+1)/2`` — AA vs KK is +0.62 (81%), AA vs 72o is
++0.78 (89%), AKs vs QQ is -0.07 (46%).
 
 **Cost is per board, not per pair.** The naive reading — enumerate runouts for
 each of the ~1.6M hand pairs — is ~2.8e12 evaluations and hopeless. Instead each
@@ -126,6 +135,7 @@ def preflop_ev_matrix(
     c = jnp.zeros((N_HANDS, N_HANDS), jnp.int32)
 
   chunks = _board_chunks(exact, total, seed, chunk, skip=done)
+
 
   t0, start, since_ckpt = time.time(), done, 0
   for block in chunks:

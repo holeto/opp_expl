@@ -66,7 +66,7 @@ def solve_shove_fold(
   """
   ev = np.asarray(ev, dtype=np.float64)
   mask = MASK_NP.astype(np.float64)
-  #Showdown utility for each hand configuration
+  #EV: A matrix indexed by (p1_hand, p2_hand), giving the 
   m_ev = mask * ev
 
   # t_b <= bb * Σ_a MASK[a,b] x_a           (big blind folds)
@@ -86,6 +86,7 @@ def solve_shove_fold(
   ])
   #First sequence probabilities (in this case, just a standard pbt distribution)
   bounds = [(0.0, 1.0)] * N_HANDS + [(None, None)] * N_HANDS
+  breakpoint()
 
   res = linprog(c, A_ub=a_ub, b_ub=b_ub, bounds=bounds, method=method)
   if not res.success:

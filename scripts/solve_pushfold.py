@@ -29,14 +29,22 @@ def main():
   ap.add_argument("--limp", action="store_true", help="allow the limp (NOT chart-comparable)")
   args = ap.parse_args()
 
+
   big_blind, small_blind = 2.0, 1.0
   stack = args.bb * big_blind
+
+  
 
   print(f"Loading equity matrix ({'exact' if args.exact_equity else f'MC {args.boards:,}'})…")
   ev = equity.preflop_ev_matrix(
     n_boards=args.boards, exact=args.exact_equity, progress=True
   )
-
+  print("\nSolving the same game exactly by LP…")
+  t0 = time.time()
+  lp_v, lp_x, lp_y = lp_reference.solve_shove_fold(
+    np.asarray(ev), small_blind=small_blind, big_blind=big_blind, stake=stack
+  )
+  print(f"  solved in {time.time() - t0:.1f}s")
   rules = betting.make_rules(stack, small_blind, big_blind, 2.0, 0)
   tr = tree.build_preflop_tree(rules, allow_limp=args.limp)
   legal = solver.legal_mask(tr)
@@ -75,12 +83,6 @@ def main():
     print("Validating the limp tree exactly would need a sequence-form LP.")
     return
 
-  print("\nSolving the same game exactly by LP…")
-  t0 = time.time()
-  lp_v, lp_x, lp_y = lp_reference.solve_shove_fold(
-    np.asarray(ev), small_blind=small_blind, big_blind=big_blind, stake=stack
-  )
-  print(f"  solved in {time.time() - t0:.1f}s")
 
   ALL_IN, CALL = betting.ALL_IN, betting.CALL
   cfr_x = np.asarray(avg[0][:, ALL_IN])
