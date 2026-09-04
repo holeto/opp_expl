@@ -208,32 +208,37 @@ def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
   Checks whether the joint reaches form a valid probability distribution over
   terminals.
 
-  **Why chance does not appear, and when that would become a bug.** Omitting
-  chance reach from a conservation check is a real hazard: in a tree where chance
-  branches into subtrees, summing only the players' reaches over terminals gives 1
-  *per subtree*, so the total comes out as the number of chance outcomes rather
-  than 1. That failure is silent and looks like a passing check with the wrong
-  target.
+  **Two different statements, only one of which is true unconditionally.** It is
+  tempting to summarise this as "the reaches sum to one over terminals". Over
+  terminal *histories* — which include the deal — that is **false**, and whether
+  chance is an explicit node or merely an array index has nothing to do with it.
+  Take both players shoving with probability 1: every valid deal then reaches one
+  terminal with joint player reach 1, so
 
-  It does not arise here because **this tree contains no chance nodes at all**.
-  The deal is not a branch — it is the *index* of the reach vectors, so the tree
-  below the root is a plain perfect-recall game tree for each fixed ``(a, b)``.
-  Accordingly ``total`` is kept as a ``(n_hands, n_hands)`` matrix and every entry
-  is asserted to be 1 — the check is performed *per chance outcome*, which is the
-  correct generalisation. Collapsing it with ``total.sum()`` would be exactly the
-  bug above and would read ``n_hands**2 = 1_758_276`` instead of 1.
+      Σ_{a,b} Σ_z r0(z)[a] · r1(z)[b]  =  N_DEALS  =  1_624_350
 
-  The chance-weighted form ``Σ_{a,b} P(a,b) · total[a,b] == 1`` is asserted too. It
-  is implied by the per-entry version here (a convex combination of ones), so it
-  is redundant today — but it is the form that stays correct if chance nodes are
-  ever put *into* the tree, as a postflop extension dealing board runouts would
-  do. At that point the per-entry assertion would start failing for the right
-  reason and this one would keep working.
+  Only the chance weight brings that back to 1. What *is* true unconditionally is
+  the per-deal statement, which is what the formula above says: hold ``(a, b)``
+  fixed and the players' reaches form a probability distribution over terminals.
+  That is why ``total`` is kept as a ``(n_hands, n_hands)`` matrix rather than
+  collapsed — the assertion is made once per chance outcome, never across them.
+
+  Both forms are therefore asserted:
+
+  * per deal, ``Σ_z r0(z)[a] · r1(z)[b] == 1`` for every ``(a, b)``;
+  * over histories, ``Σ_{a,b} P(a,b) · total[a,b] == 1`` with
+    ``P(a,b) = MASK[a,b] / N_DEALS``.
+
+  The second is implied by the first *here* (a convex combination of ones), but it
+  is the one that keeps its meaning if chance nodes are ever put into the tree —
+  a postflop extension dealing board runouts — at which point the per-deal form
+  would need reinterpreting and this one would not.
   """
   total = jnp.zeros((n_hands, n_hands), dtype)
 
   def go(ref, r0, r1):
     nonlocal total
+    #Type of the node plus id of the node
     kind, i = ref
     if kind == "T":
       total = total + jnp.outer(r0, r1)
@@ -242,6 +247,7 @@ def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
     for atom, child in enumerate(node.child):
       if child is None:
         continue
+      #Strategy over all infosets at that public state
       w = sigma[i][:, atom]
       go(child, r0 * w, r1) if node.player == 0 else go(child, r0, r1 * w)
 
