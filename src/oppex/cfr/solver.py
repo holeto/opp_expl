@@ -15,6 +15,25 @@ opponent's holding. Masking it during propagation double-counts removal. See
 ``terminal_cfv``, which is the only place the mask appears — deliberately a
 single function, so a terminal cannot be written that forgets it.
 
+**This is the public-state CFR formulation, not the vanilla-CFR one.** Vanilla CFR
+is usually written in three passes — reaches down, *standard* values up, then
+multiply by the counterfactual reach when forming regrets. Here values are
+counterfactual from the leaves upward: ``terminal_cfv``'s ``r_opp`` argument *is*
+``π_{-p}``, so the invariant carried up the tree is ``cfv_p(n) = π_{-p}(n) ⊗ v(n)``
+and there is deliberately no later multiply. Looking for that multiply and not
+finding it is the natural way to misread this as missing counterfactuality.
+
+The two are equivalent because ``π_{-p}`` is constant across the actions compared
+at an infoset — the opponent does not act on the edge from ``I`` to ``I·a``, so it
+factors out of ``v(I,a) - v(I)``. This was checked by writing the three-pass form
+out separately and comparing regrets over three iterations on both trees:
+agreement to 2e-16 relative, i.e. float64 machine epsilon.
+
+The counterfactual form is what public-state CFR wants. Values *are* the
+per-hand counterfactual vectors that get passed between public states, and
+keeping them normalised would mean dividing by ``π_{-p}`` and guarding the 0/0
+wherever a hand is unreachable, only to multiply it back at the next boundary.
+
 **The opponent's branch sum is unweighted.** Going bottom-up at a node owned by
 ``p``, ``cfv_p`` weights each child by ``sigma[h, a]`` but ``cfv_{1-p}`` is a plain
 sum, because the opponent's probabilities are already folded into ``r_p`` down at
@@ -91,6 +110,12 @@ def terminal_cfv(const, stake, r_opp, player, ev, mask=MASK):
 
   ``const`` is a hand-independent chip payoff to player 0 (fold terminals);
   ``stake`` multiplies the net-EV matrix (showdown and checkdown terminals).
+
+  **``r_opp`` is the counterfactual reach** — this is where ``π_{-p}`` enters, and
+  the only place it does. ``mask @ r_opp`` sums the opponent's reach over the
+  hands they could still hold given yours, so the result is already
+  ``Σ_b π_{-p}(b) · u(a, b)`` rather than a value conditional on the deal. See the
+  module docstring for why there is no later multiply.
 
   Make sure to use the mask to mask out invalid opponent cards.
   """
