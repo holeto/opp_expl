@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Local equity-matrix caches; the canonical location is $OPPEX_CACHE or
+# ~/.cache/oppex, but keep stray in-repo copies out of version control.
+*.npy
+cache/
