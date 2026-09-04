@@ -36,6 +36,22 @@ Monte Carlo shares one board sample across all pairs, so a board touching either
 hand is invalid *for that pair*. Dividing by a global board count is therefore
 biased; the ``C`` accumulator counts valid boards per pair, which is what makes
 the estimator unbiased.
+
+**Optimisations that measured slower, so the obvious ones stay tried.** The inner
+loop is memory-bandwidth bound — two ``(1326,1326)`` int32 accumulators read and
+written per board, ~28 MB of traffic — while hand evaluation is only 21% of the
+cost. Against the current 4.5-5.4 ms/board:
+
+* *Upper triangle only* (``EV`` is antisymmetric, so half the entries are
+  redundant): **8.17 ms**, 1.8x slower. Halving the traffic does not pay for
+  gathering 878,475 index pairs. Storage would drop 7.03 MB to 3.5 MB, on a file
+  read once.
+* *int16 accumulators* (half the traffic again): 7.07 ms, slower — poor
+  vectorisation at that width.
+* *Batching boards before reducing*: 8.17 ms at B=8, 31.18 ms at B=16 — it
+  materialises the ``(B,1326,1326)`` intermediate that ``lax.scan`` exists to avoid.
+* *Dropping ``C``* (constant in exact mode): 4.81 ms, ~10% — real but it costs the
+  unbiased MC estimator, so it is not worth the branch.
 """
 
 from __future__ import annotations

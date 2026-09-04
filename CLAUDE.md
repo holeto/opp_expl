@@ -171,10 +171,12 @@ The chance constant `1/N_DEALS` is deferred to the reporting boundary, keeping c
 O(1e4) rather than O(1e-5) in float32. Safe only because the deal is uniform, so the
 constant is global and regret matching is scale-invariant.
 
-`equity.py` costs ~5.4 ms/board and is dominated by the pairwise accumulation, not
-hand evaluation (21%). int16 accumulators and batching are both *slower* — measured.
-Exhaustive enumeration is ~4h, so MC is the default; runs checkpoint every 20k boards
-and resume bit-identically.
+`equity.py` costs ~4.5–5.4 ms/board, dominated by memory traffic in the pairwise
+accumulation, not hand evaluation (21%). Every obvious optimisation measured
+*slower* and is listed in its docstring — including storing only the upper triangle
+(1.8x slower: gathering 878k index pairs costs more than the halved traffic saves,
+despite `EV` being antisymmetric). Exhaustive enumeration is ~3-4h, so MC is the
+default; runs checkpoint every 20k boards and resume bit-identically.
 
 `allow_limp=True` values a limped pot as a checkdown, which hands the SB a free
 showdown real postflop play would punish. It is a valid debug target but **cannot be
