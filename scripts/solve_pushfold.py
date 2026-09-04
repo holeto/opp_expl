@@ -61,6 +61,7 @@ def main():
   print(f"  {args.iters} iterations in {dt:.1f}s ({dt / args.iters * 1000:.1f} ms/iter)")
 
   avg = solver.average_strategy(tab, legal)
+  breakpoint()
 
   # ── Invariants ─────────────────────────────────────────────────────────────
   zs = solver.check_zero_sum(tr, avg, ev, N_HANDS)
@@ -84,9 +85,12 @@ def main():
   lp_sig0 = seqform.behaviour_strategy(tr, sf, r0, 0)
   lp_sig1 = seqform.behaviour_strategy(tr, sf, r1, 1)
 
+
   print(f"\n{'':22s}{'CFR':>12s}{'LP (exact)':>12s}{'diff':>10s}")
   print(f"  {'value to SB (bb)':20s}{float(v0) / big_blind:>12.5f}"
         f"{lp_v / big_blind:>12.5f}{abs(float(v0) - lp_v) / big_blind:>10.2e}")
+  
+  breakpoint()
   for i, node in enumerate(tr.nodes):
     sig = lp_sig0.get(i, lp_sig1.get(i))
     for a in (a for a, c in enumerate(node.child) if c is not None):
@@ -94,6 +98,7 @@ def main():
       name = {0: "FOLD", 1: "CALL", 2: "ALL_IN"}.get(a, f"BET_{a - 3}")
       print(f"  n{i} P{node.player} {name:<14s}{cfr_f:>12.5f}{lp_f:>12.5f}"
             f"{abs(cfr_f - lp_f):>10.2e}")
+  breakpoint()
 
   lp_reference.check_against_cfr(lp_v, br0 * big_blind, br1 * big_blind)
   print(f"\n  LP sandwich BR0 >= v >= -BR1 holds "

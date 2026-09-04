@@ -144,7 +144,6 @@ def constraint_matrices(tree: PreflopTree, sf: SequenceForm, player: int):
     blocks[parent] = -ident
     rows.append(_row_block(blocks, h))
     rhs.append(np.zeros(h))
-    breakpoint()
 
   E = vstack(rows, format="csr")
   assert E.shape[1] == n_var
@@ -214,8 +213,6 @@ def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "hig
   # Player 1's realisation plan is the dual of the inequality block.
   y = np.clip(-np.asarray(res.ineqlin.marginals), 0.0, None).reshape(sf.n_seq[1], n_hands)
   value = float(-res.fun)
-
-  breakpoint()
   _check_realisation(tree, sf, x, 0)
   _check_realisation(tree, sf, y, 1)
   return value, x, y, sf
