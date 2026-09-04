@@ -203,10 +203,32 @@ def check_zero_sum(tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32):
 
 
 def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
-  """``Σ_terminals r0(z)[a] * r1(z)[b] * rc(z)[a, b] == 1`` for every hand pair ``(a, b)``.
+  """``Σ_terminals r0(z)[a] * r1(z)[b] == 1`` for every hand pair ``(a, b)``.
 
-  Checks whether the joint reaches form a valid probability
-  distribution over terminals
+  Checks whether the joint reaches form a valid probability distribution over
+  terminals.
+
+  **Why chance does not appear, and when that would become a bug.** Omitting
+  chance reach from a conservation check is a real hazard: in a tree where chance
+  branches into subtrees, summing only the players' reaches over terminals gives 1
+  *per subtree*, so the total comes out as the number of chance outcomes rather
+  than 1. That failure is silent and looks like a passing check with the wrong
+  target.
+
+  It does not arise here because **this tree contains no chance nodes at all**.
+  The deal is not a branch — it is the *index* of the reach vectors, so the tree
+  below the root is a plain perfect-recall game tree for each fixed ``(a, b)``.
+  Accordingly ``total`` is kept as a ``(n_hands, n_hands)`` matrix and every entry
+  is asserted to be 1 — the check is performed *per chance outcome*, which is the
+  correct generalisation. Collapsing it with ``total.sum()`` would be exactly the
+  bug above and would read ``n_hands**2 = 1_758_276`` instead of 1.
+
+  The chance-weighted form ``Σ_{a,b} P(a,b) · total[a,b] == 1`` is asserted too. It
+  is implied by the per-entry version here (a convex combination of ones), so it
+  is redundant today — but it is the form that stays correct if chance nodes are
+  ever put *into* the tree, as a postflop extension dealing board runouts would
+  do. At that point the per-entry assertion would start failing for the right
+  reason and this one would keep working.
   """
   total = jnp.zeros((n_hands, n_hands), dtype)
 
@@ -225,6 +247,15 @@ def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
 
   ones = jnp.ones(n_hands, dtype)
   go(("D", tree.root), ones, ones)
+
   err = float(jnp.abs(total - 1.0).max())
-  assert err <= tol, f"joint reach does not sum to 1 (max error {err:.3e})"
+  assert err <= tol, f"joint reach does not sum to 1 per deal (max error {err:.3e})"
+
+  # Chance-weighted total. P(a, b) = MASK[a, b] / N_DEALS is the uniform measure
+  # over disjoint pairs, so this is a proper probability distribution over deals.
+  weighted = float((MASK / N_DEALS * total).sum())
+  assert abs(weighted - 1.0) <= tol, (
+    f"chance-weighted joint reach is {weighted:.6f}, not 1 — if chance nodes were "
+    "added to the tree, the per-deal assertion above is no longer the right check"
+  )
   return err
