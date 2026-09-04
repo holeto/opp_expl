@@ -112,12 +112,14 @@ def constraint_matrices(tree: PreflopTree, sf: SequenceForm, player: int):
   """
   h = sf.n_hands
   n_var = sf.n_seq[player] * h
+  #Eye matrix, as each public state has n_hands infosets in it
   ident = csr_matrix(np.eye(h))
   rows, rhs = [], []
 
   # r(empty, ·) = 1
   blocks = [None] * sf.n_seq[player]
   blocks[0] = ident
+  #Each of the root infosets has realization plan of 1
   rows.append(_row_block(blocks, h))
   rhs.append(np.ones(h))
 
@@ -129,10 +131,20 @@ def constraint_matrices(tree: PreflopTree, sf: SequenceForm, player: int):
       if child is None:
         continue
       blocks[sf.seq_of[(player, i, atom)]] = ident
+    # `enumerate_sequences` hands out strictly increasing indices as it descends,
+    # and the sequence leading *into* a node is allocated at an ancestor (or is
+    # the empty sequence 0), so it is always strictly below every sequence
+    # leading out. A collision would mean the node is reachable from itself —
+    # a cycle rather than a tree — so assert it instead of merging blocks.
     parent = sf.parent_seq[i]
-    blocks[parent] = -ident if blocks[parent] is None else blocks[parent] - ident
+    assert blocks[parent] is None, (
+      f"node {i}: incoming sequence {parent} is also one of its outgoing "
+      "sequences, so the tree contains a cycle"
+    )
+    blocks[parent] = -ident
     rows.append(_row_block(blocks, h))
     rhs.append(np.zeros(h))
+    breakpoint()
 
   E = vstack(rows, format="csr")
   assert E.shape[1] == n_var
@@ -179,6 +191,11 @@ def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "hig
   sf = enumerate_sequences(tree, n_hands)
   E0, e0 = constraint_matrices(tree, sf, 0)
   E1, e1 = constraint_matrices(tree, sf, 1)
+  #Matrix is unoptimized, containing 
+  # empty sequence row/collumn also per infoset
+  # This just for ease of implementation of the 
+  # cases where small blind folds where big blind 
+  # did not take an action yet.
   A = payoff_matrix(sf, ev)
 
   n_x, n_q = A.shape[0], E1.shape[0]
@@ -198,6 +215,7 @@ def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "hig
   y = np.clip(-np.asarray(res.ineqlin.marginals), 0.0, None).reshape(sf.n_seq[1], n_hands)
   value = float(-res.fun)
 
+  breakpoint()
   _check_realisation(tree, sf, x, 0)
   _check_realisation(tree, sf, y, 1)
   return value, x, y, sf
