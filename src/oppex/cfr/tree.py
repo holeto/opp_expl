@@ -200,3 +200,121 @@ def format_tree(tree: PreflopTree) -> str:
 
   walk(("D", tree.root), 0)
   return "\n".join(lines)
+
+
+# ── Level layout — the tree as arrays, grouped by depth ──────────────────────
+
+
+class TreeLayout(NamedTuple):
+  """The public tree re-expressed as per-depth gathers, for batched traversal.
+
+  The recursive traversal in ``solver`` unrolls one set of ops *per node* at
+  trace time, so compile time grows with the tree and a few hundred nodes is
+  already minutes. Every node at the same depth does the identical thing, so
+  they can be one batched op instead — which makes the graph O(depth) rather
+  than O(nodes), and turns the upward pass into a sum over an action axis.
+
+  Depth is well defined because this is a proper tree: ``build_preflop_tree``
+  creates a fresh node per edge, so every node has exactly one parent and every
+  child of a depth-``d`` node sits at depth ``d + 1``.
+
+  Nodes are held in **level-major** order (all of depth 0, then depth 1, …);
+  ``order`` maps that position to the tree's own node id and ``inv_order`` back
+  again. Terminals are held in **discovery** order — level-major, then by atom —
+  which is the order the downward pass naturally produces them in, so no
+  permutation is needed to line reaches up with payoffs.
+
+  Within a level, edges are flattened as ``e = i * n_actions + a``. The three
+  index arrays per level are all static numpy:
+
+  * ``down_node[d]`` — the ``e`` whose child is a decision node, ordered so that
+    gathering by it yields level ``d + 1`` in *its* level order.
+  * ``down_term[d]`` — the ``e`` whose child is a terminal, in discovery order.
+  * ``up_src[d]`` — for every ``e``, where its child's value lives in the
+    concatenation ``[level d+1 values; terminal values; one zero row]``. Illegal
+    edges point at the zero row, which is why they contribute nothing to a plain
+    sum and why nothing has to mask them.
+  """
+
+  n_nodes: int
+  n_terminals: int
+  n_actions: int
+  order: np.ndarray            # (n_nodes,) level-major position -> tree node id
+  inv_order: np.ndarray        # (n_nodes,) tree node id -> level-major position
+  level: tuple[tuple[int, int], ...]   # per depth, [start, stop) in level-major
+  player: np.ndarray           # (n_nodes,) level-major
+  down_node: tuple[np.ndarray, ...]
+  down_term: tuple[np.ndarray, ...]
+  up_src: tuple[np.ndarray, ...]
+  term_order: np.ndarray       # (n_terminals,) discovery position -> terminal id
+  const: np.ndarray            # (n_terminals,) discovery order
+  stake: np.ndarray            # (n_terminals,) discovery order
+
+
+def build_layout(tree: PreflopTree) -> TreeLayout:
+  """Group ``tree``'s nodes by depth and precompute the inter-level gathers."""
+  n_act, n_term = tree.n_actions, len(tree.terminals)
+
+  levels: list[list[int]] = []
+  frontier = [tree.root]
+  while frontier:
+    levels.append(frontier)
+    frontier = [
+      ch[1] for i in frontier for ch in tree.nodes[i].child
+      if ch is not None and ch[0] == "D"
+    ]
+
+  order = np.array([i for lvl in levels for i in lvl], np.int32)
+  if order.size != len(tree.nodes) or len(set(order.tolist())) != order.size:
+    raise AssertionError(
+      f"BFS reached {order.size} nodes ({len(set(order.tolist()))} distinct) but "
+      f"the tree has {len(tree.nodes)} — it is not a tree, so depth is ill-defined"
+    )
+  inv_order = np.empty(order.size, np.int32)
+  inv_order[order] = np.arange(order.size, dtype=np.int32)
+
+  bounds, off = [], 0
+  for lvl in levels:
+    bounds.append((off, off + len(lvl)))
+    off += len(lvl)
+
+  down_node, down_term, up_src = [], [], []
+  term_order: list[int] = []
+  for d, lvl in enumerate(levels):
+    nxt = levels[d + 1] if d + 1 < len(levels) else []
+    pos_next = {nid: q for q, nid in enumerate(nxt)}
+    dn, dt = [], []
+    src = np.full(len(lvl) * n_act, len(nxt) + n_term, np.int32)  # zero row
+    for ii, nid in enumerate(lvl):
+      for a, ch in enumerate(tree.nodes[nid].child):
+        if ch is None:
+          continue
+        e = ii * n_act + a
+        if ch[0] == "D":
+          dn.append(e)
+          src[e] = pos_next[ch[1]]
+        else:
+          dt.append(e)
+          src[e] = len(nxt) + len(term_order)
+          term_order.append(ch[1])
+    # BFS built `nxt` by walking this level's nodes in order and their atoms in
+    # order, which is exactly the order `dn` was appended in.
+    if [pos_next[tree.nodes[lvl[e // n_act]].child[e % n_act][1]] for e in dn] \
+        != list(range(len(nxt))):
+      raise AssertionError("down_node gather does not reproduce the next level's order")
+    down_node.append(np.array(dn, np.int32))
+    down_term.append(np.array(dt, np.int32))
+    up_src.append(src)
+
+  if len(term_order) != n_term:
+    raise AssertionError(f"discovered {len(term_order)} of {n_term} terminals")
+
+  return TreeLayout(
+    n_nodes=len(tree.nodes), n_terminals=n_term, n_actions=n_act,
+    order=order, inv_order=inv_order, level=tuple(bounds),
+    player=np.array([tree.nodes[i].player for i in order], np.int32),
+    down_node=tuple(down_node), down_term=tuple(down_term), up_src=tuple(up_src),
+    term_order=np.array(term_order, np.int32),
+    const=np.array([tree.terminals[j].const for j in term_order], np.float32),
+    stake=np.array([tree.terminals[j].stake for j in term_order], np.float32),
+  )

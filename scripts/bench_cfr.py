@@ -12,32 +12,41 @@ shows: at 50 BB with 3 bins the SB min-raises 69.7% of hands and never shoves,
 which is the checkdown artifact, not a strategy anyone should read.
 
 Measured on this CPU box, DCFR + alternating, 1326 hands, no limp, before and
-after ``terminal_cfv`` was batched into one matmul per terminal kind:
+after the traversal was batched per depth instead of recursed per node:
 
-  ====  ====  =====  =====  ===============  ==============
-    bb  bins  nodes  terms  compile(s) b/a   s/iter b/a
-  ====  ====  =====  =====  ===============  ==============
-    10     0      2      3    0.37 -> 0.46   0.0008 -> 0.0009
-    50     3     66     99    4.71 -> 3.69   0.0150 -> 0.0076
-    50     4    204    306   13.33 -> 16.54  0.0400 -> 0.0225
-   100     3    120    180    7.97 -> 7.47   0.0286 -> 0.0111
-   100     4    472    708   32.68 -> 73.49  0.1199 -> 0.0509
-  ====  ====  =====  =====  ===============  ==============
+  ====  ====  =====  =====  ================  ==================
+    bb  bins  nodes  terms  compile(s) b/a    s/iter b/a
+  ====  ====  =====  =====  ================  ==================
+    10     0      2      3    0.46 ->  0.78   0.0009 -> 0.0035
+    50     3     66     99    3.69 ->  1.49   0.0076 -> 0.0090
+    50     4    204    306   16.54 ->  1.46   0.0225 -> 0.0224
+   100     3    120    180    7.47 ->  1.35   0.0111 -> 0.0127
+   100     4    472    708   73.49 ->  1.55   0.0509 -> 0.0578
+  ====  ====  =====  =====  ================  ==================
 
-Both costs stay linear and terminals track nodes at ~1.5x, so the grid collapses
-to two constants — and each is a wall on the way up:
+**Compile no longer scales with the tree.** It was ~155 ms per node, because the
+recursive traversal emitted one set of ops per node at trace time; nodes *were*
+the graph, and 10k nodes extrapolated to ~26 minutes. Batching by depth makes the
+graph O(depth) — under ten levels even at 472 nodes — and compile flattens to
+~1.5 s everywhere on this grid. That was the binding constraint on scaling up,
+and it is gone.
 
-* **~155 ms of compile per node** (was ~69 ms before batching, which added graph
-  at the leaves). The tree is unrolled into one jaxpr by Python recursion at
-  trace time, so nodes *are* the graph. Extrapolated: ~26 min at 10k nodes.
-  This is the binding constraint and it is structural — fixing it means giving
-  up the recursion for a level-indexed array tree driven by ``lax.scan``, so
-  nodes at the same depth become one batched step. Until then, node count is the
-  number to watch when choosing an abstraction.
-* **~0.07 ms per terminal per iteration** (was ~0.16 ms), and no longer rising
-  with tree size. This is the part batching fixed, worth 1.8-2.6x on trees with
-  99 terminals or more. It is *not* the 13.8x an isolated matmul microbenchmark
-  predicts; see ``terminal_cfv`` for why, and for the compile-time price.
+It is not free. Per iteration the level machinery costs a fixed overhead that
+small trees cannot amortise: the 2-node push-fold tree is ~4x slower per
+iteration, and even 472 nodes is 13% slower. At 2000 iterations the 100 BB /
+4-bin case still wins overall (175 s -> 117 s), but by ~10k iterations the
+compile saving is amortised away and the two are level. The reason to keep it is
+what happens *above* this grid, not on it.
+
+What remains linear:
+
+* **~0.07 ms per terminal per iteration**, the 1326x1326 contractions in
+  ``terminal_cfv``. At 708 terminals that is already 80% of an iteration, so it
+  is the next thing to look at — and unlike compile it is real arithmetic, so
+  the fix is a smaller abstraction or a GPU, not a restructuring.
+* **Memory**, at ``(n_nodes, 1326, n_actions)`` per table. 472 nodes with 7 atoms
+  is 17 MB per table and there are two, plus the traversal's own ``branch``
+  array of the same shape.
 """
 
 from __future__ import annotations
