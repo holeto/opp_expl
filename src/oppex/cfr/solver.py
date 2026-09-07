@@ -51,6 +51,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .cards import MASK, N_DEALS
 from .tree import FOLD_T, PreflopTree
@@ -128,65 +129,147 @@ def average_strategy(tables: Tables, legal: jax.Array) -> jax.Array:
 # ── Terminal evaluation — the ONLY place card removal lives ──────────────────
 
 
-def terminal_cfv(const, stake, r_opp, player, ev, mask=MASK):
-  """Counterfactual values at a terminal, for every hand of ``player``.
+def _terminal_kinds(tree):
+  """Split terminals into the two matrices they contract against.
 
-  ``const`` is a hand-independent chip payoff to player 0 (fold terminals);
-  ``stake`` multiplies the net-EV matrix (showdown and checkdown terminals).
+  A fold terminal has a payoff constant and no stake; a showdown or checkdown has
+  a stake and no constant. The tree builder guarantees the split is exact, which
+  is what lets the batched contraction concatenate instead of accumulate.
+  """
+  const = np.array([t.const for t in tree.terminals], np.float32)
+  stake = np.array([t.stake for t in tree.terminals], np.float32)
+  fold, show = np.flatnonzero(const), np.flatnonzero(stake)
+  if fold.size + show.size != len(tree.terminals):
+    raise AssertionError(
+      "every terminal must have exactly one of const/stake non-zero; got "
+      f"{fold.size} fold + {show.size} showdown for {len(tree.terminals)} terminals"
+    )
+  return fold, show, const, stake
+
+
+def _inverse_perm(fold, show):
+  """Column positions that put concatenated [fold…, show…] back in tree order."""
+  perm = np.concatenate([fold, show])
+  inv = np.empty(perm.size, np.int32)
+  inv[perm] = np.arange(perm.size, dtype=np.int32)
+  return inv
+
+
+
+def terminal_cfv(tree, ev, r_opp, player, mask=MASK):
+  """Counterfactual values at **every terminal at once**, per hand of ``player``.
+
+  ``r_opp`` is ``(n_hands, n_terminals)``: column ``j`` is the *opponent's*
+  counterfactual reach at terminal ``j``. Returns the same shape.
 
   **``r_opp`` is the counterfactual reach** — this is where ``π_{-p}`` enters, and
   the only place it does. ``mask @ r_opp`` sums the opponent's reach over the
   hands they could still hold given yours, so the result is already
   ``Σ_b π_{-p}(b) · u(a, b)`` rather than a value conditional on the deal. See the
-  module docstring for why there is no later multiply.
+  module docstring for why there is no later multiply. This function is the one
+  place card removal lives, deliberately, so that no terminal can forget it.
 
-  Make sure to use the mask to mask out invalid opponent cards.
+  **Why this batches rather than taking one terminal at a time.** Every fold
+  terminal multiplies by the same ``MASK`` and every showdown by the same ``EV``;
+  only the reach column differs. One matvec per terminal makes that a stream of
+  GEMVs, each re-reading a 7 MB matrix to do 1.8 MFLOP — memory-bound. Stacking
+  the columns turns each matrix into a single GEMM.
+
+  **What that is actually worth, measured end to end**: 1.8-2.6x per iteration on
+  trees from 99 to 708 terminals (0.0150 -> 0.0076 s/iter at 50 BB / 3 bins,
+  0.1199 -> 0.0509 at 100 BB / 4 bins). Per-terminal cost falls from ~0.16 ms to
+  ~0.07 ms and stops rising with tree size.
+
+  An isolated microbenchmark of the matmul alone says 13.8x (89.6 ms of GEMVs at
+  27.8 GFLOP/s versus 6.5 ms of GEMM at 384.5 GFLOP/s). **Do not believe that
+  number in context.** The contraction is not the whole cost: stacking reach
+  columns in and gathering values back out is new work that scales with terminal
+  count too, and it lands on XLA as extra graph. At 472 nodes it makes compile
+  *worse* — 32.7 s before, 73.5 s after — so the change only pays back after
+  roughly 590 iterations. Below ~30 terminals it is a small net loss; there is
+  nothing to batch and the plumbing is pure overhead.
+
+  The two kinds are gathered apart rather than run as one full-width matmul
+  because ``const`` and ``stake`` are structurally disjoint — a fold terminal has
+  no stake, a showdown no const — so a full-width pair of matmuls would spend
+  half its FLOPs multiplying by zero. They come back concatenated by kind and one
+  gather restores tree order: an earlier version scatter-added into a zeroed
+  ``(n_hands, n_terminals)`` buffer instead, which cost another 17 s of compile
+  and 0.04 s/iter at 100 BB / 4 bins for nothing.
   """
-  out = jnp.zeros_like(r_opp)
-  if const != 0.0:
+  fold, show, const, stake = _terminal_kinds(tree)
+  cols = []
+  if fold.size:
     # `const` is chips to player 0, so player 1's view of it is negated.
-    out = out + (const if player == 0 else -const) * (mask @ r_opp)
-  if stake != 0.0:
-    # EV is antisymmetric and already mask-folded, so the *same* matvec serves
+    sign = 1.0 if player == 0 else -1.0
+    cols.append((sign * const[fold]) * (mask @ r_opp[:, fold]))
+  if show.size:
+    # EV is antisymmetric and already mask-folded, so the *same* matmul serves
     # both players with no sign flip: player 1's payoff for (b, a) is
     # stake * EV[b, a] == -stake * EV[a, b].
-    out = out + stake * (ev @ r_opp)
-  return out
+    cols.append(stake[show] * (ev @ r_opp[:, show]))
+  # Results come out grouped by kind; one gather puts them back in terminal
+  # order. Concatenate-and-gather rather than scatter-add into zeros: the
+  # kinds partition the terminals, so there is nothing to accumulate.
+  out = cols[0] if len(cols) == 1 else jnp.concatenate(cols, -1)
+  return out[:, _inverse_perm(fold, show)]
 
 
 # ── Traversal ────────────────────────────────────────────────────────────────
 
 
 def _traverse(tree, sigma, ev, r0, r1):
-  """Two passes fused into one recursion; returns per-node (cfv0, cfv1) arrays.
+  """Reaches down, all terminals evaluated at once, counterfactual values up.
 
-  Reaches flow down, counterfactual values flow up. ``cfv_p`` at a node is the
-  sigma-weighted average over children; the *opponent's* cfv is a plain sum.
+  Split into three passes rather than the one fused recursion it used to be, for
+  the sole reason that terminal evaluation wants every terminal's reach at the
+  same time — see ``terminal_cfv``. The two recursions are plain trace-time
+  Python either way, so the split costs nothing at run time.
+
+  ``cfv_p`` at a node is the sigma-weighted sum over children; the *opponent's*
+  cfv is a plain sum, because their probabilities are already inside their reach.
   """
   node_cfv: dict[int, tuple[jax.Array, jax.Array]] = {}
   node_reach: dict[int, tuple[jax.Array, jax.Array]] = {}
+  term_r0: list = [None] * len(tree.terminals)
+  term_r1: list = [None] * len(tree.terminals)
 
-  def go(ref, r0, r1):
+  def down(ref, r0, r1):
     kind, i = ref
     if kind == "T":
-      t = tree.terminals[i]
-      return (terminal_cfv(t.const, t.stake, r1, 0, ev),
-              terminal_cfv(t.const, t.stake, r0, 1, ev))
+      # Each terminal is created at exactly one edge, so this is written once.
+      term_r0[i], term_r1[i] = r0, r1
+      return
     node_reach[i] = (r0, r1)
     node = tree.nodes[i]
     p, sig = node.player, sigma[i]
-    c0s, c1s = [], []
     for atom, child in enumerate(node.child):
       if child is None:
-        c0s.append(None); c1s.append(None); continue
+        continue
       w = sig[:, atom]
-      nr0, nr1 = (r0 * w, r1) if p == 0 else (r0, r1 * w)
-      a, b = go(child, nr0, nr1)
-      c0s.append(a); c1s.append(b)
+      down(child, *((r0 * w, r1) if p == 0 else (r0, r1 * w)))
 
-    stacked0 = jnp.stack([c for c in c0s if c is not None], -1)
-    stacked1 = jnp.stack([c for c in c1s if c is not None], -1)
-    idx = [a for a, c in enumerate(c0s) if c is not None]
+  down(("D", tree.root), r0, r1)
+
+  # The opponent's reach is what each player's terminal value contracts against.
+  cfv0_t = terminal_cfv(tree, ev, jnp.stack(term_r1, -1), 0)
+  cfv1_t = terminal_cfv(tree, ev, jnp.stack(term_r0, -1), 1)
+
+  def up(ref):
+    kind, i = ref
+    if kind == "T":
+      return cfv0_t[:, i], cfv1_t[:, i]
+    node = tree.nodes[i]
+    p, sig = node.player, sigma[i]
+    c0s, c1s, idx = [], [], []
+    for atom, child in enumerate(node.child):
+      if child is None:
+        continue
+      a, b = up(child)
+      c0s.append(a); c1s.append(b); idx.append(atom)
+
+    stacked0 = jnp.stack(c0s, -1)
+    stacked1 = jnp.stack(c1s, -1)
     w = sig[:, jnp.asarray(idx)]
     # The acting player's own probabilities weight their branches; the opponent's
     # are already inside their reach at the leaves, so their branches just sum.
@@ -195,7 +278,7 @@ def _traverse(tree, sigma, ev, r0, r1):
     node_cfv[i] = (cfv0, cfv1, stacked0 if p == 0 else stacked1, idx)
     return cfv0, cfv1
 
-  root0, root1 = go(("D", tree.root), r0, r1)
+  root0, root1 = up(("D", tree.root))
   return root0, root1, node_cfv, node_reach
 
 

@@ -11,33 +11,33 @@ without an all-in is valued as a checkdown, which overpays seeing a flop; see
 shows: at 50 BB with 3 bins the SB min-raises 69.7% of hands and never shoves,
 which is the checkdown artifact, not a strategy anyone should read.
 
-Measured on this CPU box, DCFR + alternating, 1326 hands, no limp:
+Measured on this CPU box, DCFR + alternating, 1326 hands, no limp, before and
+after ``terminal_cfv`` was batched into one matmul per terminal kind:
 
-  ====  ====  =====  =====  ==========  ======
-    bb  bins  nodes  terms  compile(s)  s/iter
-  ====  ====  =====  =====  ==========  ======
-    10     0      2      3        0.37  0.0008
-    50     3     66     99        4.71  0.0150
-    50     4    204    306       13.33  0.0400
-   100     3    120    180        7.97  0.0286
-   100     4    472    708       32.68  0.1199
-  ====  ====  =====  =====  ==========  ======
+  ====  ====  =====  =====  ===============  ==============
+    bb  bins  nodes  terms  compile(s) b/a   s/iter b/a
+  ====  ====  =====  =====  ===============  ==============
+    10     0      2      3    0.37 -> 0.46   0.0008 -> 0.0009
+    50     3     66     99    4.71 -> 3.69   0.0150 -> 0.0076
+    50     4    204    306   13.33 -> 16.54  0.0400 -> 0.0225
+   100     3    120    180    7.97 -> 7.47   0.0286 -> 0.0111
+   100     4    472    708   32.68 -> 73.49  0.1199 -> 0.0509
+  ====  ====  =====  =====  ===============  ==============
 
-Both costs are linear and terminals track nodes at ~1.5x, so the whole grid
-collapses to two constants — and each is a wall on the way up:
+Both costs stay linear and terminals track nodes at ~1.5x, so the grid collapses
+to two constants — and each is a wall on the way up:
 
-* **~69 ms of compile per node.** The tree is unrolled into one jaxpr by Python
-  recursion at trace time, so nodes *are* the graph. Extrapolated: ~11 min at
-  10k nodes, ~2 h at 100k. This is the binding constraint, and it is structural
-  — fixing it means giving up the recursion for a level-indexed array tree
-  driven by ``lax.scan``, so nodes at the same depth become one batched step.
-* **~0.16 ms per terminal per iteration**, all of it 1326x1326 matvecs in
-  ``terminal_cfv``. Cheaper to fix: every fold terminal multiplies by the same
-  ``MASK`` and every showdown by the same ``EV``, so stacking each kind's
-  ``r_opp`` into a matrix turns N matvecs into one matmul. Measured directly at
-  N=708: 89.6 ms of GEMVs (27.8 GFLOP/s) versus 6.5 ms for the equivalent GEMM
-  (384.5 GFLOP/s) — 13.8x, and it also cuts that case's compile from 100 s to
-  0.03 s, so it takes a bite out of the first wall too.
+* **~155 ms of compile per node** (was ~69 ms before batching, which added graph
+  at the leaves). The tree is unrolled into one jaxpr by Python recursion at
+  trace time, so nodes *are* the graph. Extrapolated: ~26 min at 10k nodes.
+  This is the binding constraint and it is structural — fixing it means giving
+  up the recursion for a level-indexed array tree driven by ``lax.scan``, so
+  nodes at the same depth become one batched step. Until then, node count is the
+  number to watch when choosing an abstraction.
+* **~0.07 ms per terminal per iteration** (was ~0.16 ms), and no longer rising
+  with tree size. This is the part batching fixed, worth 1.8-2.6x on trees with
+  99 terminals or more. It is *not* the 13.8x an isolated matmul microbenchmark
+  predicts; see ``terminal_cfv`` for why, and for the compile-time price.
 """
 
 from __future__ import annotations
