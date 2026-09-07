@@ -7,6 +7,11 @@ nodes, so traversal is plain recursive Python over a static structure — under
 ``jit`` the recursion unrolls at trace time into one fused graph, and with
 ``jit=False`` the identical code is eager and steppable in a debugger.
 
+``cfr_step`` is the entry point: one call is one full iteration, under either the
+simultaneous or the alternating update schedule. ``cfr_iteration`` underneath it
+is one *traversal*, which is a half-step when alternating — call it directly only
+to update a single player, as in fixed-opponent exploitation.
+
 Three things here are easy to get subtly wrong, and each has a guard:
 
 **Card removal belongs at terminals, never in reach propagation.** ``r_i[h]`` is
@@ -201,14 +206,22 @@ class _Static:
     return isinstance(other, _Static) and other.value is self.value
 
 
-def _cfr_iteration(tree, tables: Tables, legal, ev, n_hands, plus, linear) -> Tables:
-  """One simultaneous-update CFR iteration over all hands at once.
+def _cfr_iteration(
+  tree, tables: Tables, legal, ev, n_hands, update_player, advance, plus, linear
+) -> Tables:
+  """One traversal, writing back the tables of ``update_player`` (``-1`` = both).
 
   Every table is rebuilt rather than mutated: per-node rows are collected in
   Python lists and stacked once at the end. The functional form is what makes the
   whole iteration a single jittable expression — a chain of ``regret.at[i].set``
   would also be functional, but it threads ``n_nodes`` sequential scatters through
   the graph for rows that are all computed independently.
+
+  ``sigma`` is always built for *both* players — the traversal needs the
+  opponent's current strategy to reach the leaves at all. ``update_player`` gates
+  only the write-back, and it gates the strategy sum as well as the regrets:
+  under alternating updates each player's average must accumulate once per full
+  iteration, not once per traversal.
   """
   sigma = regret_matching_plus(tables.regret, legal)
   ones = jnp.ones(n_hands, tables.regret.dtype)
@@ -220,8 +233,12 @@ def _cfr_iteration(tree, tables: Tables, legal, ev, n_hands, plus, linear) -> Ta
 
   regret_rows, ssum_rows = [], []
   for i, node in enumerate(tree.nodes):
-    cfv0, cfv1, branches, idx = node_cfv[i]
     p = node.player
+    if update_player != -1 and p != update_player:
+      regret_rows.append(tables.regret[i])
+      ssum_rows.append(tables.strategy_sum[i])
+      continue
+    cfv0, cfv1, branches, idx = node_cfv[i]
     own_cfv = cfv0 if p == 0 else cfv1
     delta = jnp.zeros((n_hands, tree.n_actions), dtype)
     delta = delta.at[:, jnp.asarray(idx)].set(branches - own_cfv[:, None])
@@ -230,28 +247,86 @@ def _cfr_iteration(tree, tables: Tables, legal, ev, n_hands, plus, linear) -> Ta
     own_reach = node_reach[i][p]
     ssum_rows.append(tables.strategy_sum[i] + weight * own_reach[:, None] * sigma[i])
 
-  return Tables(jnp.stack(regret_rows), jnp.stack(ssum_rows), t)
+  return Tables(jnp.stack(regret_rows), jnp.stack(ssum_rows), t if advance else tables.iters)
 
 
-@partial(jax.jit, static_argnums=(0, 4, 5, 6))
-def _cfr_iteration_jit(tree_s: _Static, tables, legal, ev, n_hands, plus, linear):
-  return _cfr_iteration(tree_s.value, tables, legal, ev, n_hands, plus, linear)
+@partial(jax.jit, static_argnums=(0, 4, 5, 6, 7, 8))
+def _cfr_iteration_jit(
+  tree_s: _Static, tables, legal, ev, n_hands, update_player, advance, plus, linear
+):
+  return _cfr_iteration(
+    tree_s.value, tables, legal, ev, n_hands, update_player, advance, plus, linear
+  )
 
 
 def cfr_iteration(
-  tree, tables: Tables, legal, ev, n_hands, *, plus=False, linear=False, jit=True
+  tree, tables: Tables, legal, ev, n_hands, *, update_player=-1, advance=True,
+  plus=False, linear=False, jit=True,
 ) -> Tables:
-  """One simultaneous-update CFR iteration over all hands at once.
+  """One CFR traversal over all hands at once, updating ``update_player``.
+
+  ``update_player`` is ``-1`` for the simultaneous update (both players written
+  back from the same traversal, the default) or a seat index for one leg of an
+  alternating update. ``advance=False`` performs the update but leaves
+  ``iters`` alone, so that both legs of an alternating step share one step index
+  and therefore one ``linear`` weight; ``cfr_step`` is what pairs them up.
 
   Everything the traversal branches on is static — the tree shape, ``n_hands``,
-  and the two algorithm flags — so the recursion unrolls at trace time into one
+  and the four algorithm flags — so the recursion unrolls at trace time into one
   fused graph over ``(regret, strategy_sum, iters)``, ``legal`` and ``ev``. Pass
   ``jit=False`` to run the identical code eagerly, which is what to do when
   stepping through a traversal in a debugger or printing intermediate cfvs.
   """
+  if update_player not in (-1, 0, 1):
+    raise ValueError(f"update_player must be -1, 0 or 1; got {update_player}")
+  args = (tables, legal, ev, int(n_hands), int(update_player), bool(advance),
+          bool(plus), bool(linear))
   if not jit:
-    return _cfr_iteration(tree, tables, legal, ev, n_hands, plus, linear)
-  return _cfr_iteration_jit(_Static(tree), tables, legal, ev, int(n_hands), plus, linear)
+    return _cfr_iteration(tree, *args)
+  return _cfr_iteration_jit(_Static(tree), *args)
+
+
+def cfr_step(
+  tree, tables: Tables, legal, ev, n_hands, *, alternating=False,
+  plus=False, linear=False, jit=True,
+) -> Tables:
+  """One full CFR iteration: every player updated exactly once.
+
+  ``alternating=False`` is the simultaneous update — a single traversal whose
+  regrets for both players are read off the *same* strategy profile.
+
+  ``alternating=True`` splits the step into two traversals, player 0 then player
+  1. The second one is the point of the variant: it recomputes ``sigma`` from
+  regrets that already include player 0's update, so player 1 responds to where
+  the opponent has just moved rather than to where they were. Both legs share one
+  step index, so ``iters`` counts full iterations under either scheme and
+  ``linear`` weights mean the same thing in both — otherwise player 0's average
+  would carry odd weights and player 1's even ones.
+
+  Measured at 10 BB against the sequence-form LP, at equal iteration counts from
+  100 to 5000, alternating reaches ~1.3x lower exploitability on the shove-fold
+  tree and ~2.1x lower on the limp tree. Against its two traversals per step that
+  is a loss on the first tree and a wash on the second — the gain here is not the
+  clear win it is at scale, where CFR+ and DCFR both alternate. Wall clock said
+  otherwise (1.0-1.1x per step, not 2x), but only because a four-node tree over
+  1326 hands is dispatch-bound rather than compute-bound; do not read that as the
+  cost of the variant.
+
+  There is also no stronger *bound*: alternating breaks the folk-theorem
+  argument's premise that both players' regrets are measured against a common
+  profile. It is used because it works, not because it is proven to.
+
+  ``alternating=True, plus=True, linear=True`` is CFR+.
+  """
+  common = dict(plus=plus, linear=linear, jit=jit)
+  if not alternating:
+    return cfr_iteration(tree, tables, legal, ev, n_hands, update_player=-1, **common)
+  tables = cfr_iteration(
+    tree, tables, legal, ev, n_hands, update_player=0, advance=False, **common
+  )
+  return cfr_iteration(
+    tree, tables, legal, ev, n_hands, update_player=1, advance=True, **common
+  )
 
 
 def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32):

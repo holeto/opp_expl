@@ -27,6 +27,8 @@ def main():
   ap.add_argument("--boards", type=int, default=200_000)
   ap.add_argument("--exact-equity", action="store_true")
   ap.add_argument("--limp", action="store_true", help="allow the limp (NOT chart-comparable)")
+  ap.add_argument("--alternating", action="store_true",
+                  help="alternating updates (two traversals per iteration) instead of simultaneous")
   ap.add_argument("--no-lp", action="store_true", help="skip the exact LP reference")
   args = ap.parse_args()
 
@@ -43,7 +45,8 @@ def main():
   rules = betting.make_rules(stack, small_blind, big_blind, 2.0, 0)
   tr = tree.build_preflop_tree(rules, allow_limp=args.limp)
   legal = solver.legal_mask(tr)
-  print(f"\nTree ({args.bb:g} BB, limp={args.limp}): "
+  print(f"\nTree ({args.bb:g} BB, limp={args.limp}, "
+        f"{'alternating' if args.alternating else 'simultaneous'}): "
         f"{len(tr.nodes)} decisions, {len(tr.terminals)} terminals")
 
   # ── CFR ────────────────────────────────────────────────────────────────────
@@ -51,7 +54,7 @@ def main():
   t0 = time.time()
   print(f"\n{'iter':>7}  {'exploitability(bb)':>19}  {'value(bb)':>10}")
   for it in range(1, args.iters + 1):
-    tab = solver.cfr_iteration(tr, tab, legal, ev, N_HANDS)
+    tab = solver.cfr_step(tr, tab, legal, ev, N_HANDS, alternating=args.alternating)
     if it in (1, 10, 100) or it % max(args.iters // 8, 1) == 0:
       avg = solver.average_strategy(tab, legal)
       e, br0, br1 = exploit.exploitability(tr, avg, ev, N_HANDS, big_blind)
