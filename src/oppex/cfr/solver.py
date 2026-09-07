@@ -34,17 +34,6 @@ factors out of ``v(I,a) - v(I)``. This was checked by writing the three-pass for
 out separately and comparing regrets over three iterations on both trees:
 agreement to 2e-16 relative, i.e. float64 machine epsilon.
 
-The counterfactual form is what public-state CFR wants. Values *are* the
-per-hand counterfactual vectors that get passed between public states, and
-keeping them normalised would mean dividing by ``π_{-p}`` and guarding the 0/0
-wherever a hand is unreachable, only to multiply it back at the next boundary.
-
-**The opponent's branch sum is unweighted.** Going bottom-up at a node owned by
-``p``, ``cfv_p`` weights each child by ``sigma[h, a]`` but ``cfv_{1-p}`` is a plain
-sum, because the opponent's probabilities are already folded into ``r_p`` down at
-the leaves. Weighting both is the classic vector-CFR bug; ``check_zero_sum``
-catches it on the first iteration.
-
 **The chance constant is deferred.** Root reaches are all-ones and counterfactual
 values carry no chance factor, keeping them O(1e4) rather than O(1e-5) in float32.
 The deal is uniform over disjoint pairs, so ``1 / N_DEALS`` is a single global
@@ -71,6 +60,34 @@ class Tables(NamedTuple):
   regret: jax.Array      # (n_nodes, n_hands, n_actions)
   strategy_sum: jax.Array  # (n_nodes, n_hands, n_actions)
   iters: jax.Array       # () int32
+
+
+class Discount(NamedTuple):
+  """Discounted-CFR coefficients (Brown & Sandholm 2019).
+
+  At the end of iteration ``t`` (1-indexed, so ``iters + 1``) the accumulators are
+  rescaled: positive cumulative regret by ``t^α / (t^α + 1)``, negative cumulative
+  regret by ``t^β / (t^β + 1)``, and the cumulative strategy by ``(t / (t+1))^γ``.
+
+  **The instantaneous regret is added first, then the product is discounted.**
+  That ordering is not cosmetic — it is the one that makes ``α = β = γ = 1``
+  reproduce Linear CFR exactly. Unrolling ``R^t = (R^{t-1} + r^t) · t/(t+1)``
+  gives ``R^T = (Σ_t t · r^t) / (T+1)``, i.e. weights proportional to ``t``.
+  Discounting before the add gives weights proportional to ``t + 1`` instead —
+  the same asymptotics, a different algorithm.
+
+  The defaults are the paper's recommended setting. ``β = 0`` is not "no
+  discounting on negatives": ``t^0 = 1``, so negative regret is *halved* every
+  iteration, which is the point — it lets a badly-regretted action come back into
+  play far faster than vanilla CFR while still not being floored outright the way
+  ``plus`` floors it.
+  """
+  alpha: float = 1.5   # positive cumulative regret
+  beta: float = 0.0    # negative cumulative regret
+  gamma: float = 2.0   # cumulative strategy
+
+
+DCFR = Discount()
 
 
 def init_tables(tree: PreflopTree, n_hands: int, dtype=jnp.float32) -> Tables:
@@ -207,7 +224,8 @@ class _Static:
 
 
 def _cfr_iteration(
-  tree, tables: Tables, legal, ev, n_hands, update_player, advance, plus, linear
+  tree, tables: Tables, legal, ev, n_hands, update_player, advance, plus, linear,
+  discount,
 ) -> Tables:
   """One traversal, writing back the tables of ``update_player`` (``-1`` = both).
 
@@ -229,7 +247,16 @@ def _cfr_iteration(
 
   dtype = tables.regret.dtype
   t = tables.iters + 1
-  weight = t.astype(dtype) if linear else jnp.asarray(1.0, dtype)
+  tf = t.astype(dtype)
+  if discount is None:
+    weight = tf if linear else jnp.asarray(1.0, dtype)
+  else:
+    # Discounting the accumulator subsumes weighting the contribution, so the
+    # contribution goes in unweighted; see Discount for why the add comes first.
+    weight = jnp.asarray(1.0, dtype)
+    ta, tb = tf ** discount.alpha, tf ** discount.beta
+    pos_d, neg_d = ta / (ta + 1.0), tb / (tb + 1.0)
+    ssum_d = (tf / (tf + 1.0)) ** discount.gamma
 
   regret_rows, ssum_rows = [], []
   for i, node in enumerate(tree.nodes):
@@ -243,25 +270,47 @@ def _cfr_iteration(
     delta = jnp.zeros((n_hands, tree.n_actions), dtype)
     delta = delta.at[:, jnp.asarray(idx)].set(branches - own_cfv[:, None])
     new = tables.regret[i] + delta
-    regret_rows.append(jnp.maximum(new, 0.0) if plus else new)
+    if plus:
+      new = jnp.maximum(new, 0.0)
+    elif discount is not None:
+      new = jnp.where(new > 0.0, new * pos_d, new * neg_d)
+    regret_rows.append(new)
+
     own_reach = node_reach[i][p]
-    ssum_rows.append(tables.strategy_sum[i] + weight * own_reach[:, None] * sigma[i])
+    ssum = tables.strategy_sum[i] + weight * own_reach[:, None] * sigma[i]
+    ssum_rows.append(ssum if discount is None else ssum * ssum_d)
 
   return Tables(jnp.stack(regret_rows), jnp.stack(ssum_rows), t if advance else tables.iters)
 
 
-@partial(jax.jit, static_argnums=(0, 4, 5, 6, 7, 8))
+@partial(jax.jit, static_argnums=(0, 4, 5, 6, 7, 8, 9))
 def _cfr_iteration_jit(
-  tree_s: _Static, tables, legal, ev, n_hands, update_player, advance, plus, linear
+  tree_s: _Static, tables, legal, ev, n_hands, update_player, advance, plus, linear,
+  discount,
 ):
   return _cfr_iteration(
-    tree_s.value, tables, legal, ev, n_hands, update_player, advance, plus, linear
+    tree_s.value, tables, legal, ev, n_hands, update_player, advance, plus, linear,
+    discount,
   )
+
+
+def _check_scheme(plus, linear, discount):
+  """``discount`` supersedes ``plus``/``linear``; combining them double-weights."""
+  if discount is None:
+    return
+  clash = [n for n, v in (("plus", plus), ("linear", linear)) if v]
+  if clash:
+    raise ValueError(
+      f"discount= cannot be combined with {'/'.join(clash)}= — alpha/beta/gamma "
+      "already control regret and average weighting, so the two compose into a "
+      "scheme that is neither. Use beta<0 for the DCFR analogue of plus, and "
+      "gamma=1 for the analogue of linear."
+    )
 
 
 def cfr_iteration(
   tree, tables: Tables, legal, ev, n_hands, *, update_player=-1, advance=True,
-  plus=False, linear=False, jit=True,
+  plus=False, linear=False, discount: Discount | None = None, jit=True,
 ) -> Tables:
   """One CFR traversal over all hands at once, updating ``update_player``.
 
@@ -279,8 +328,9 @@ def cfr_iteration(
   """
   if update_player not in (-1, 0, 1):
     raise ValueError(f"update_player must be -1, 0 or 1; got {update_player}")
+  _check_scheme(plus, linear, discount)
   args = (tables, legal, ev, int(n_hands), int(update_player), bool(advance),
-          bool(plus), bool(linear))
+          bool(plus), bool(linear), discount)
   if not jit:
     return _cfr_iteration(tree, *args)
   return _cfr_iteration_jit(_Static(tree), *args)
@@ -288,7 +338,7 @@ def cfr_iteration(
 
 def cfr_step(
   tree, tables: Tables, legal, ev, n_hands, *, alternating=False,
-  plus=False, linear=False, jit=True,
+  plus=False, linear=False, discount: Discount | None = None, jit=True,
 ) -> Tables:
   """One full CFR iteration: every player updated exactly once.
 
@@ -303,22 +353,44 @@ def cfr_step(
   ``linear`` weights mean the same thing in both — otherwise player 0's average
   would carry odd weights and player 1's even ones.
 
-  Measured at 10 BB against the sequence-form LP, at equal iteration counts from
-  100 to 5000, alternating reaches ~1.3x lower exploitability on the shove-fold
-  tree and ~2.1x lower on the limp tree. Against its two traversals per step that
-  is a loss on the first tree and a wash on the second — the gain here is not the
-  clear win it is at scale, where CFR+ and DCFR both alternate. Wall clock said
-  otherwise (1.0-1.1x per step, not 2x), but only because a four-node tree over
-  1326 hands is dispatch-bound rather than compute-bound; do not read that as the
-  cost of the variant.
+  Exploitability in bb/hand at 10 BB, verified against the sequence-form LP:
+
+  ======================  =========  =========  =========  =========
+  scheme                  @100 (sf)  @5000 (sf) @100 (limp) @5000 (limp)
+  ======================  =========  =========  =========  =========
+  vanilla, simultaneous    6.6e-03    1.3e-04    1.5e-02    3.3e-04
+  vanilla, alternating     5.0e-03    9.9e-05    7.6e-03    1.6e-04
+  CFR+                     1.7e-04    8.7e-08    8.0e-04    9.9e-07
+  DCFR, alternating        6.0e-06      *        2.4e-04    3.1e-07
+  DCFR, simultaneous       1.8e-05      *        4.5e-03    1.8e-06
+  ======================  =========  =========  =========  =========
+
+  Two things to read off it. Alternating alone buys only 1.3-2.1x, which against
+  two traversals per step is a loss on the shove-fold tree and a wash on the limp
+  one — it earns its keep in combination, not on its own (DCFR alternating beats
+  DCFR simultaneous by 5.7x on the limp tree). And the discounting is where the
+  order of magnitude lives: DCFR at 100 iterations is already better than vanilla
+  at 5000.
+
+  ``*`` is not a number because by then the *measurement* has run out: at ~1e-8
+  the exploitability estimate is float32 cancellation noise between two BR values
+  of magnitude ~0.09, and it goes slightly negative. Below ~1e-7, tighten the
+  dtype before believing a comparison.
+
+  Wall clock does not track traversal count here (alternating costs 1.0-1.1x per
+  step, not 2x): four nodes over 1326 hands is dispatch-bound, not compute-bound.
 
   There is also no stronger *bound*: alternating breaks the folk-theorem
   argument's premise that both players' regrets are measured against a common
   profile. It is used because it works, not because it is proven to.
 
-  ``alternating=True, plus=True, linear=True`` is CFR+.
+  ``alternating=True, plus=True, linear=True`` is CFR+;
+  ``alternating=True, discount=DCFR`` is Discounted CFR. Both legs of an
+  alternating step share one ``t``, so each player's accumulators are discounted
+  exactly once per full iteration under either update schedule.
   """
-  common = dict(plus=plus, linear=linear, jit=jit)
+  _check_scheme(plus, linear, discount)
+  common = dict(plus=plus, linear=linear, discount=discount, jit=jit)
   if not alternating:
     return cfr_iteration(tree, tables, legal, ev, n_hands, update_player=-1, **common)
   tables = cfr_iteration(
