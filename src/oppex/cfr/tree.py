@@ -75,18 +75,34 @@ def _key(bs: BettingState):
 
 
 def build_preflop_tree(
-  rules: BettingRules, *, allow_limp: bool = True, max_depth: int = 8
+  rules: BettingRules, *, allow_limp: bool = True, max_depth: int = 8,
+  allow_bets: bool = False, max_nodes: int = 100_000,
 ) -> PreflopTree:
-  """Enumerate the preflop public tree under the push-fold abstraction."""
-  if rules.bet_bins.shape[0] != 0:
+  """Enumerate the preflop public tree.
+
+  ``allow_bets`` opts in to pot-fraction bet atoms (``num_bet_bins > 0``). It is
+  off by default because of the leaf valuation, not the enumeration: every line
+  that closes preflop without an all-in becomes a ``CHECKDOWN`` terminal, valued
+  as though both players check down from there. With bet atoms most lines end
+  that way, and each one hands both players full showdown equity in a pot they
+  bought cheaply — so the solver sees raise-and-see-a-flop as far better than it
+  is. **A tree built with ``allow_bets=True`` is a scaling and speed benchmark,
+  not a preflop solution**, and the same caveat that rules out chart comparison
+  for ``allow_limp=True`` applies here with more force.
+
+  ``max_nodes`` is a tripwire, not a bound anyone should hit: the tree unrolls
+  into the jit graph at trace time, so node count is compile time.
+  """
+  if rules.bet_bins.shape[0] != 0 and not allow_bets:
     raise ValueError(
-      "the preflop tree currently supports the push-fold abstraction only "
-      f"(num_bet_bins=0); got {rules.bet_bins.shape[0]} bet atoms. Pot-fraction "
-      "bet atoms need a leaf valuation better than checkdown equity."
+      f"got {rules.bet_bins.shape[0]} bet atoms but allow_bets=False. Pot-fraction "
+      "bet atoms need a leaf valuation better than checkdown equity; pass "
+      "allow_bets=True to build the tree anyway for scaling work."
     )
   n_actions = betting.num_atoms(rules)
   nodes: list[DecisionNode] = []
   terminals: list[TerminalNode] = []
+  dropped: list[tuple[int, int, int]] = []
 
   def add_terminal(kind, const, stake, bs) -> tuple[str, int]:
     terminals.append(TerminalNode(kind, float(const), float(stake), bs))
@@ -96,6 +112,8 @@ def build_preflop_tree(
     if depth > max_depth:
       raise RuntimeError(f"preflop tree deeper than max_depth={max_depth}")
     slot = len(nodes)
+    if slot >= max_nodes:
+      raise RuntimeError(f"preflop tree exceeded max_nodes={max_nodes}")
     nodes.append(None)  # reserve, so children get later indices
     legal = np.asarray(
       betting.legal_atoms(rules, bs, drop_duplicate_allin=True)
@@ -115,12 +133,17 @@ def build_preflop_tree(
 
       # Two sibling edges reaching the same public state ARE the same action;
       # BettingState carries no history, so this catches duplicates for free.
+      # Bet atoms collide routinely once `chips_added` clips them — every bin
+      # above the stack lands on the all-in state, and adjacent bins can round
+      # together in a small pot. Keeping both would split regret mass across
+      # identical columns, so the later atom is struck from `legal` instead.
+      # Atom order means the survivor is the more canonical label: ALL_IN beats
+      # a bet bin that clipped to it, and a smaller bin beats a larger one.
       k = _key(out.state)
       if k in seen:
-        raise AssertionError(
-          f"atoms {_ATOM_NAME.get(seen[k], seen[k])} and "
-          f"{_ATOM_NAME.get(atom, atom)} lead to the same public state"
-        )
+        legal[atom] = False
+        dropped.append((slot, seen[k], atom))
+        continue
       seen[k] = atom
 
       committed = out.state.committed
@@ -145,6 +168,11 @@ def build_preflop_tree(
 
   kind, root = visit(betting.initial_state(rules), 0)
   assert kind == "D", "the root must be a decision node"
+  if rules.bet_bins.shape[0] == 0 and dropped:
+    raise AssertionError(
+      "duplicate sibling actions in a push-fold tree, where clipping cannot "
+      f"create them — this is a betting-rules bug, not a bin collision: {dropped}"
+    )
   return PreflopTree(rules, tuple(nodes), tuple(terminals), n_actions, root)
 
 

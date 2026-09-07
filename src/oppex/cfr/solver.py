@@ -353,37 +353,6 @@ def cfr_step(
   ``linear`` weights mean the same thing in both — otherwise player 0's average
   would carry odd weights and player 1's even ones.
 
-  Exploitability in bb/hand at 10 BB, verified against the sequence-form LP:
-
-  ======================  =========  =========  =========  =========
-  scheme                  @100 (sf)  @5000 (sf) @100 (limp) @5000 (limp)
-  ======================  =========  =========  =========  =========
-  vanilla, simultaneous    6.6e-03    1.3e-04    1.5e-02    3.3e-04
-  vanilla, alternating     5.0e-03    9.9e-05    7.6e-03    1.6e-04
-  CFR+                     1.7e-04    8.7e-08    8.0e-04    9.9e-07
-  DCFR, alternating        6.0e-06      *        2.4e-04    3.1e-07
-  DCFR, simultaneous       1.8e-05      *        4.5e-03    1.8e-06
-  ======================  =========  =========  =========  =========
-
-  Two things to read off it. Alternating alone buys only 1.3-2.1x, which against
-  two traversals per step is a loss on the shove-fold tree and a wash on the limp
-  one — it earns its keep in combination, not on its own (DCFR alternating beats
-  DCFR simultaneous by 5.7x on the limp tree). And the discounting is where the
-  order of magnitude lives: DCFR at 100 iterations is already better than vanilla
-  at 5000.
-
-  ``*`` is not a number because by then the *measurement* has run out: at ~1e-8
-  the exploitability estimate is float32 cancellation noise between two BR values
-  of magnitude ~0.09, and it goes slightly negative. Below ~1e-7, tighten the
-  dtype before believing a comparison.
-
-  Wall clock does not track traversal count here (alternating costs 1.0-1.1x per
-  step, not 2x): four nodes over 1326 hands is dispatch-bound, not compute-bound.
-
-  There is also no stronger *bound*: alternating breaks the folk-theorem
-  argument's premise that both players' regrets are measured against a common
-  profile. It is used because it works, not because it is proven to.
-
   ``alternating=True, plus=True, linear=True`` is CFR+;
   ``alternating=True, discount=DCFR`` is Discounted CFR. Both legs of an
   alternating step share one ``t``, so each player's accumulators are discounted
