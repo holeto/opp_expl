@@ -52,7 +52,8 @@ not be if chance weights varied by hand.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from functools import partial
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -176,28 +177,81 @@ def _traverse(tree, sigma, ev, r0, r1):
   return root0, root1, node_cfv, node_reach
 
 
-def cfr_iteration(tree, tables: Tables, legal, ev, n_hands, *, plus=False, linear=False):
-  """One simultaneous-update CFR iteration over all hands at once."""
+class _Static:
+  """Identity-hashable box, so a pytree-shaped value can be a static ``jit`` arg.
+
+  ``PreflopTree`` is a ``NamedTuple`` holding ``BettingState`` arrays, so it is
+  neither hashable (arrays aren't) nor usable as a traced argument (its nodes are
+  Python structure that traversal must branch on). Boxing it defers both problems
+  to object identity: two calls share a trace iff they were handed the same tree
+  object. Trees are built once and reused, so that is exactly the caching wanted —
+  rebuilding a structurally identical tree merely re-traces, it never silently
+  reuses a stale graph.
+  """
+
+  __slots__ = ("value",)
+
+  def __init__(self, value: Any):
+    self.value = value
+
+  def __hash__(self) -> int:
+    return id(self.value)
+
+  def __eq__(self, other: object) -> bool:
+    return isinstance(other, _Static) and other.value is self.value
+
+
+def _cfr_iteration(tree, tables: Tables, legal, ev, n_hands, plus, linear) -> Tables:
+  """One simultaneous-update CFR iteration over all hands at once.
+
+  Every table is rebuilt rather than mutated: per-node rows are collected in
+  Python lists and stacked once at the end. The functional form is what makes the
+  whole iteration a single jittable expression — a chain of ``regret.at[i].set``
+  would also be functional, but it threads ``n_nodes`` sequential scatters through
+  the graph for rows that are all computed independently.
+  """
   sigma = regret_matching_plus(tables.regret, legal)
   ones = jnp.ones(n_hands, tables.regret.dtype)
   _, _, node_cfv, node_reach = _traverse(tree, sigma, ev, ones, ones)
 
-  regret, ssum = tables.regret, tables.strategy_sum
+  dtype = tables.regret.dtype
   t = tables.iters + 1
-  weight = t.astype(regret.dtype) if linear else jnp.asarray(1.0, regret.dtype)
+  weight = t.astype(dtype) if linear else jnp.asarray(1.0, dtype)
 
+  regret_rows, ssum_rows = [], []
   for i, node in enumerate(tree.nodes):
     cfv0, cfv1, branches, idx = node_cfv[i]
     p = node.player
     own_cfv = cfv0 if p == 0 else cfv1
-    delta = jnp.zeros((n_hands, tree.n_actions), regret.dtype)
+    delta = jnp.zeros((n_hands, tree.n_actions), dtype)
     delta = delta.at[:, jnp.asarray(idx)].set(branches - own_cfv[:, None])
-    new = regret[i] + delta
-    regret = regret.at[i].set(jnp.maximum(new, 0.0) if plus else new)
+    new = tables.regret[i] + delta
+    regret_rows.append(jnp.maximum(new, 0.0) if plus else new)
     own_reach = node_reach[i][p]
-    ssum = ssum.at[i].add(weight * own_reach[:, None] * sigma[i])
+    ssum_rows.append(tables.strategy_sum[i] + weight * own_reach[:, None] * sigma[i])
 
-  return Tables(regret, ssum, t)
+  return Tables(jnp.stack(regret_rows), jnp.stack(ssum_rows), t)
+
+
+@partial(jax.jit, static_argnums=(0, 4, 5, 6))
+def _cfr_iteration_jit(tree_s: _Static, tables, legal, ev, n_hands, plus, linear):
+  return _cfr_iteration(tree_s.value, tables, legal, ev, n_hands, plus, linear)
+
+
+def cfr_iteration(
+  tree, tables: Tables, legal, ev, n_hands, *, plus=False, linear=False, jit=True
+) -> Tables:
+  """One simultaneous-update CFR iteration over all hands at once.
+
+  Everything the traversal branches on is static — the tree shape, ``n_hands``,
+  and the two algorithm flags — so the recursion unrolls at trace time into one
+  fused graph over ``(regret, strategy_sum, iters)``, ``legal`` and ``ev``. Pass
+  ``jit=False`` to run the identical code eagerly, which is what to do when
+  stepping through a traversal in a debugger or printing intermediate cfvs.
+  """
+  if not jit:
+    return _cfr_iteration(tree, tables, legal, ev, n_hands, plus, linear)
+  return _cfr_iteration_jit(_Static(tree), tables, legal, ev, int(n_hands), plus, linear)
 
 
 def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32):
@@ -228,36 +282,10 @@ def check_zero_sum(tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32):
 
 
 def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
-  """``Σ_terminals r0(z)[a] * r1(z)[b] == 1`` for every hand pair ``(a, b)``.
+  """``Σ_terminals r0(z)[a] * r1(z)[b]  * r_c(z) [a,b] == 1`` for every hand pair ``(a, b)``.
 
   Checks whether the joint reaches form a valid probability distribution over
   terminals.
-
-  **Two different statements, only one of which is true unconditionally.** It is
-  tempting to summarise this as "the reaches sum to one over terminals". Over
-  terminal *histories* — which include the deal — that is **false**, and whether
-  chance is an explicit node or merely an array index has nothing to do with it.
-  Take both players shoving with probability 1: every valid deal then reaches one
-  terminal with joint player reach 1, so
-
-      Σ_{a,b} Σ_z r0(z)[a] · r1(z)[b]  =  N_DEALS  =  1_624_350
-
-  Only the chance weight brings that back to 1. What *is* true unconditionally is
-  the per-deal statement, which is what the formula above says: hold ``(a, b)``
-  fixed and the players' reaches form a probability distribution over terminals.
-  That is why ``total`` is kept as a ``(n_hands, n_hands)`` matrix rather than
-  collapsed — the assertion is made once per chance outcome, never across them.
-
-  Both forms are therefore asserted:
-
-  * per deal, ``Σ_z r0(z)[a] · r1(z)[b] == 1`` for every ``(a, b)``;
-  * over histories, ``Σ_{a,b} P(a,b) · total[a,b] == 1`` with
-    ``P(a,b) = MASK[a,b] / N_DEALS``.
-
-  The second is implied by the first *here* (a convex combination of ones), but it
-  is the one that keeps its meaning if chance nodes are ever put into the tree —
-  a postflop extension dealing board runouts — at which point the per-deal form
-  would need reinterpreting and this one would not.
   """
   total = jnp.zeros((n_hands, n_hands), dtype)
 
