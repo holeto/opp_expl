@@ -1,8 +1,10 @@
 from .base import Env
+from .goofspiel import Goofspiel
 from .hunl_holdem import HunlHoldem
 
 _REGISTRY: dict[str, type] = {
-  "hunl": HunlHoldem
+  "goofspiel": Goofspiel,
+  "hunl": HunlHoldem,
 }
 
 

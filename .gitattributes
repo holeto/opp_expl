@@ -6,3 +6,4 @@
 
 # Binary caches (equity matrices) must never be line-ending converted.
 *.npy binary
+

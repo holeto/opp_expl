@@ -1,0 +1,46 @@
+# QMMD on 4-card Goofspiel with a random prize order (the stochastic variant).
+# Small enough for exact NashConv: scripts/eval_exploitability.py checkpoints/qmmd_goofspiel4
+seed: 0
+env:
+  name: goofspiel
+  n_cards: 4
+  prize_order: random
+  reward_type: difference
+algorithm:
+  type: qmmd
+  batch_size: 256
+  rollout_len: 4            # = n_cards: one game per row, exactly RLG's layout
+  n_epochs: 1
+  optimizer:
+    type: adam
+    lr: 0.0003
+  clip_eps: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  gamma: 1.0
+  gae_lambda: 1.0
+  magnet_coef: 0.2
+  old_policy_coef: 0.05
+  target_update_rate: 0.001
+  magnet_update_type: incremental   # moving magnet; 'periodic' uses magnet_interval
+  magnet_update_rate: 0.001
+  magnet_interval: 2000
+  loss_type: mmd                    # or 'rnad' (NeuRD)
+  agent:
+    type: policy_q
+    network:
+      type: twin_head
+      torso:
+        type: mlp
+        feature_dim: 128
+        hidden: [128, 128]
+        activation: gelu
+        norm: rms
+      head1: {type: categorical, n_actions: null}
+      head2: {type: q, n_actions: null}
+trainer:
+  n_steps: 20000
+  log_every: 1000
+  checkpoint_every: 2000
+  checkpoint_dir: checkpoints/qmmd_goofspiel4
+  save_metrics: true

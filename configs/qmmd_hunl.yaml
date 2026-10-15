@@ -1,0 +1,63 @@
+# QMMD on heads-up no-limit hold'em, following notes/mmd_hunl_tuning.md:
+# moving magnet (Polyak, no swaps) at the target network's rate (~5e-5),
+# batch pushed as far as memory allows, rows of 40 auto-resetting steps,
+# cosine-decayed learning rate.
+seed: 0
+env:
+  name: hunl
+  starting_stack: 400
+  small_blind: 1
+  big_blind: 2
+  max_bet_fraction: 2.0
+  num_bet_bins: 4
+  reward_type: difference
+  drop_duplicate_allin: true
+algorithm:
+  type: qmmd
+  batch_size: 8000
+  rollout_len: 40
+  n_epochs: 1
+  optimizer:
+    type: adam
+    # decay_steps: null → the whole run (trainer.n_steps × n_epochs updates).
+    # alpha is the final fraction of init_value. A warmup variant:
+    # {type: warmup_cosine_decay, init_value: 0.0, peak_value: 0.0003, warmup_steps: 1000, decay_steps: null}
+    lr: {type: cosine_decay, init_value: 0.0003, decay_steps: null, alpha: 0.0}
+    max_grad_norm: 1.0
+  clip_eps: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.005
+  gamma: 1.0
+  gae_lambda: 0.95
+  magnet_coef: 0.2
+  old_policy_coef: 0.05
+  target_update_rate: 0.00005
+  magnet_update_type: incremental
+  magnet_update_rate: 0.00005
+  loss_type: mmd
+  agent:
+    type: policy_q
+    network:
+      type: twin_head
+      torso:
+        type: mlp
+        feature_dim: 512
+        hidden: [512, 512, 512]
+        activation: gelu
+        norm: rms
+      head1: {type: categorical, n_actions: null}
+      head2: {type: q, n_actions: null}
+    # Privileged Q-critic (sees both hands); the actor still sees only its infoset:
+    # type: privileged_policy_q
+    # network:
+    #   type: split_twin_head
+    #   actor_torso:  {type: mlp, feature_dim: 512, hidden: [512, 512, 512], activation: gelu, norm: rms}
+    #   actor_head:   {type: categorical, n_actions: null}
+    #   critic_torso: {type: mlp, feature_dim: 512, hidden: [512, 512, 512], activation: gelu, norm: rms}
+    #   critic_head:  {type: q, n_actions: null}
+trainer:
+  n_steps: 1000000
+  log_every: 500
+  checkpoint_every: 10000
+  checkpoint_dir: checkpoints/qmmd_hunl
+  save_metrics: true

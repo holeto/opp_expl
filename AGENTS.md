@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PhD research code on opponent exploitation in imperfect-information games. Pure-JAX
 environments plus a public-state CFR solver built on them. Early stage: the env layer
-(`oppex.envs`) and a preflop push-fold CFR solver (`oppex.cfr`) exist; RL training does
-not yet.
+(`oppex.envs`: HUNL, Goofspiel), a preflop push-fold CFR solver (`oppex.cfr`), and a
+policy-gradient baseline (QMMD, ported from the sibling RLG repo) with exact
+exploitability for small games (`oppex.tree`) exist.
 
 ## Commands
 
@@ -23,17 +24,23 @@ The distribution is `opponent-exploitation` but the importable package is **`opp
 (`src/oppex/`), decoupled via `[tool.uv.build-backend] module-name` in `pyproject.toml`.
 Always use absolute imports — `from oppex.envs import build_env`.
 
-No test runner, linter, or CLI entry point is wired up yet. JAX resolves to the CPU build
-here; a CUDA jaxlib is not installed.
+```bash
+uv run python scripts/train.py configs/qmmd_goofspiel.yaml [--resume]   # QMMD from a YAML config
+uv run python scripts/eval_exploitability.py checkpoints/qmmd_goofspiel4 # exact NashConv per checkpoint
+```
+
+No test runner or linter is wired up yet. JAX resolves to the CPU build here; a CUDA
+jaxlib is not installed.
 
 ## Architecture
 
 ### Layering
 
 Docstrings refer to numbered layers ("Layer 3 — Environments" in
-[base.py](src/oppex/envs/base.py)); the lower layers are not written yet. Treat that
-numbering as the intended structure, not as existing code. New layers go in as sibling
-subpackages of `oppex.envs`.
+[base.py](src/oppex/envs/base.py), "Layer 5" for `oppex.algorithms`, "Layer 6" for
+`oppex.trainers`); the lowest layers are not written yet. Treat that numbering as the
+intended structure, not as existing code. New layers go in as sibling subpackages of
+`oppex.envs` (`networks`, `agents`, `losses`, `algorithms`, `trainers`, `tree` follow this).
 
 An earlier design paired the env with a hybrid discrete–continuous policy (a Gaussian
 bet-sizing head trained by an MMD loss in `losses/mmd_cont.py`). **That approach was
@@ -201,6 +208,63 @@ reference; a sequence-form LP (cheapest on a small synthetic deck) would close t
 [envs/\_\_init\_\_.py](src/oppex/envs/__init__.py) holds a name→class `_REGISTRY` and
 `build_env(cfg)`, which pops `name` and forwards the rest as kwargs. Register new
 environments there.
+
+## RL training — QMMD ([src/oppex/algorithms/](src/oppex/algorithms/))
+
+Ported from RLG `algorithms/mmd_q.py` (`QMMD`): Magnetic Mirror Descent with a policy head
+and a Q-head (no V-head), Q-targets by Retrace(λ) over the Polyak *target* network's
+Q-values. On-policy, so the IS ratio is 1 and Retrace reduces to Expected SARSA(λ).
+Policy loss is PPO-clipped on a centred all-actions advantage (`loss_type=mmd`) or NeuRD
+(`loss_type=rnad`); `+ magnet_coef·KL(π‖magnet) + old_policy_coef·KL(π‖μ) − ent_coef·H`.
+The α-entmax path and the LaProp/Muon optimizers from RLG were deliberately not ported:
+every policy here is a masked softmax and `oppex.policy` has no `alpha`.
+
+**Moving magnet.** `magnet_update_type="incremental"` (the default) Polyak-averages the
+magnet toward the current params at `magnet_update_rate` every step instead of hard-copying
+every `magnet_interval` steps (`"periodic"`). For HUNL, `notes/mmd_hunl_tuning.md` puts both
+target and magnet rates around 5e-5.
+
+**Learning-rate schedule.** The notes also ask for a cosine-decayed learning rate.
+`optimizer.lr` takes a number or a schedule spec
+(`{type: cosine_decay, init_value, decay_steps, alpha}`; also `warmup_cosine_decay`).
+`decay_steps: null` is filled with the run length. Optax counts *optimizer updates*, not
+training steps, so the fill is `n_steps × n_epochs`. The coefficient `schedules` are
+evaluated on the training step instead. Only the learning rate is injected into the optimizer state
+(`inject_learning_rate`), and the applied rate is logged as `lr`. Injecting Adam's `b1`/`b2`/`eps`
+too shifts rounding by an ulp, enough for a run to drift from plain-Adam reruns. Checkpoints
+saved before this change have a different `opt_state` and cannot be resumed.
+
+**Rollouts auto-reset; they do not pad** ([rollout.py](src/oppex/algorithms/rollout.py)).
+Each of B rows is a fixed window of T steps over a continuing stream of games: when a game
+ends, a fresh `init_state` is dealt in place (so chance is still drawn once per game). The
+env state at the window's end is carried in `TrainingState` and resumes next iteration.
+This *differs from RLG*, whose collector — despite its docstring — ran every row from a fresh
+deal for `env.max_length` steps and masked everything after the terminal. For HUNL that is
+~97% padding (hands average ~4 steps against `max_length` 124). Consequences to keep in mind:
+
+- A row usually ends mid-game, so the last Retrace target bootstraps from
+  `E_μ[Q_target(s_T)]` (`retrace(..., bootstrap_v=)`). RLG hard-coded 0 there, which is only
+  right when every row ends on a terminal. Episode boundaries *inside* a row need nothing:
+  `discount = 0` at a terminal cuts both bootstrap and trace.
+- There is no validity mask — every step is real data; the loss is a plain mean over B·T
+  (summed over players).
+- A game reaching `env.max_length` is force-reset and recorded as a **zero-reward
+  terminal** (`truncated`). Never fires in Goofspiel; watch `truncated_frac` for HUNL.
+- With `rollout_len = n_cards` on Goofspiel each row is exactly one game — RLG's layout.
+
+`PrivilegedPolicyQAgent` (with a `split_twin_head` network) gives the Q-critic
+`state_representation` (both hands) while the actor still sees only its infoset; it is the
+only case where the rollout stores `state_reps`.
+
+Checkpoints are `step_{step:08d}.pkl` pickles of the whole `TrainingState` (RLG saved
+`{counter}.pkl` but resumed from `step_*.pkl`, so its `--resume` never found anything).
+Seed with `jax.random.PRNGKey`, not a typed `jax.random.key`, so state pickles plainly.
+
+**Validation.** `oppex.tree` (RLG `src/tree`) enumerates the full history tree of small
+games and computes exact best responses; `scripts/eval_exploitability.py` reports NashConv
+for the current, target and magnet params of each checkpoint, in raw reward units. The
+port was checked against RLG directly: Goofspiel observations/transitions are identical,
+and `mmd_q_loss` values and gradients match RLG's for both loss types and KL directions.
 
 ## Style
 

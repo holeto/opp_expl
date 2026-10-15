@@ -7,3 +7,9 @@ __pycache__/
 # ~/.cache/oppex, but keep stray in-repo copies out of version control.
 *.npy
 cache/
+
+#Coding agents
+.claude/
+
+# Training runs (checkpoints, metrics, exploitability curves).
+checkpoints/
