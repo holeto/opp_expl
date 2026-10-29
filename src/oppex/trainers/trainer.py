@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 
 from .base import Logger, Trainer
-from ..algorithms.base import Algorithm
+from ..policy_gradient.algorithms.base import Algorithm
 
 
 class StdoutLogger(Logger):
@@ -51,9 +51,25 @@ def list_checkpoints(checkpoint_dir: str) -> list[str]:
   return sorted(glob.glob(os.path.join(checkpoint_dir, "step_*.pkl")))
 
 
+# Checkpoints pickle classes by module path, and ``oppex.algorithms`` /
+# ``oppex.losses`` moved under ``oppex.policy_gradient``. Old paths are rewritten
+# on load so checkpoints saved before the move still open.
+_MOVED_MODULES = ("oppex.algorithms", "oppex.losses")
+
+
+class _CheckpointUnpickler(pickle.Unpickler):
+
+  def find_class(self, module: str, name: str) -> Any:
+    for old in _MOVED_MODULES:
+      if module == old or module.startswith(old + "."):
+        module = "oppex.policy_gradient" + module[len("oppex"):]
+        break
+    return super().find_class(module, name)
+
+
 def load_checkpoint(path: str) -> Any:
   with open(path, "rb") as f:
-    return pickle.load(f)
+    return _CheckpointUnpickler(f).load()
 
 
 def latest_checkpoint(checkpoint_dir: str) -> str:

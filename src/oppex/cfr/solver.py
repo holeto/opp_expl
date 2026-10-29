@@ -51,6 +51,14 @@ matching, regret clipping and reach-weighted averaging are all invariant to a
 global positive rescaling. It is therefore applied only at the reporting
 boundary, in ``root_value``. This is safe *because* the deal is uniform; it would
 not be if chance weights varied by hand.
+
+**Matrix-valued leaves** (``tree.MATRIX_T``, see ``leaves.py``) are terminals at
+which both players pick a continuation strategy simultaneously. They carry
+their own regret tables, ``Tables.leaf_regret``, one row per (player, leaf,
+hand) over the ``T`` continuations. A traversal reaches them like any terminal,
+and then their per-continuation values come from ``leaf_action_cfv``. The
+update rule is shared with the decision nodes (``_accumulate``), so the two
+kinds of table cannot drift apart under any scheme.
 """
 
 from __future__ import annotations
@@ -63,13 +71,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from .cards import MASK, N_DEALS
-from .tree import FOLD_T, PreflopTree, TreeLayout, build_layout
+from .leaves import Leaves, leaf_action_cfv
+from .tree import (
+  CHECKDOWN_T, FOLD_T, MATRIX_T, SHOWDOWN_T, PreflopTree, TreeLayout, build_layout,
+)
 
 
 class Tables(NamedTuple):
   regret: jax.Array      # (n_nodes, n_hands, n_actions)
   strategy_sum: jax.Array  # (n_nodes, n_hands, n_actions)
   iters: jax.Array       # () int32
+  leaf_regret: jax.Array        # (2, n_leaves, n_hands, n_transforms)
+  leaf_strategy_sum: jax.Array  # (2, n_leaves, n_hands, n_transforms)
 
 
 class Discount(NamedTuple):
@@ -100,9 +113,16 @@ class Discount(NamedTuple):
 DCFR = Discount()
 
 
-def init_tables(tree: PreflopTree, n_hands: int, dtype=jnp.float32) -> Tables:
+def init_tables(
+  tree: PreflopTree, n_hands: int, dtype=jnp.float32, n_transforms: int = 1,
+) -> Tables:
+  """Zeroed tables; a tree without matrix leaves gets zero-size leaf tables."""
   shape = (len(tree.nodes), n_hands, tree.n_actions)
-  return Tables(jnp.zeros(shape, dtype), jnp.zeros(shape, dtype), jnp.int32(0))
+  leaf_shape = (2, len(tree.leaves), n_hands, n_transforms)
+  return Tables(
+    jnp.zeros(shape, dtype), jnp.zeros(shape, dtype), jnp.int32(0),
+    jnp.zeros(leaf_shape, dtype), jnp.zeros(leaf_shape, dtype),
+  )
 
 
 def legal_mask(tree: PreflopTree) -> jax.Array:
@@ -127,34 +147,67 @@ def regret_matching_plus(regret: jax.Array, legal: jax.Array) -> jax.Array:
 
 def average_strategy(tables: Tables, legal: jax.Array) -> jax.Array:
   """"""
+  return _normalise(tables.strategy_sum, legal)
+
+
+def _normalise(ssum: jax.Array, legal: jax.Array) -> jax.Array:
+  # Per-row distribution from a strategy sum, uniform over legal where empty.
   legal_b = legal[:, None, :]
-  ssum = jnp.where(legal_b, tables.strategy_sum, 0.0)
+  ssum = jnp.where(legal_b, ssum, 0.0)
   denom = ssum.sum(-1, keepdims=True)
   safe = denom + (denom == 0)
   uniform = legal_b / legal.sum(-1)[:, None, None]
   return jnp.where(denom > 0.0, ssum / safe, uniform).astype(ssum.dtype)
 
 
+def _flat_leaf(x: jax.Array) -> jax.Array:
+  # (2, n_leaves, n_hands, T) -> (2 * n_leaves, n_hands, T), the node-table
+  # layout, so leaf tables reuse the node strategy functions.
+  return x.reshape((-1,) + x.shape[2:])
+
+
+def leaf_strategy(tables: Tables) -> jax.Array:
+  """Current continuation strategy ``tau``, ``(2, n_leaves, n_hands, T)``."""
+  r = tables.leaf_regret
+  legal = jnp.ones((r.shape[0] * r.shape[1], r.shape[-1]), bool)
+  return regret_matching_plus(_flat_leaf(r), legal).reshape(r.shape)
+
+
+def average_leaf_strategy(tables: Tables) -> jax.Array:
+  """Average continuation strategy, ``(2, n_leaves, n_hands, T)``."""
+  s = tables.leaf_strategy_sum
+  legal = jnp.ones((s.shape[0] * s.shape[1], s.shape[-1]), bool)
+  return _normalise(_flat_leaf(s), legal).reshape(s.shape)
+
+
 # ── Terminal evaluation — the ONLY place card removal lives ──────────────────
 
 
 def _terminal_kinds(layout: TreeLayout):
-  """Split terminals into the two matrices they contract against.
+  """Split terminals into the two matrices they contract against, plus leaves.
 
   A fold terminal has a payoff constant and no stake; a showdown or checkdown has
   a stake and no constant. The tree builder guarantees the split is exact, which
-  is what lets the batched contraction concatenate instead of accumulate.
+  is what lets the batched contraction concatenate instead of accumulate. A
+  matrix leaf has neither: its value depends on the continuations chosen there,
+  so ``terminal_cfv`` leaves its rows at zero for ``_leaf_terminal_cfv`` to fill.
   """
-  fold, show = np.flatnonzero(layout.const), np.flatnonzero(layout.stake)
-  if fold.size + show.size != layout.n_terminals:
+  fold = np.flatnonzero(layout.kind == FOLD_T)
+  show = np.flatnonzero((layout.kind == SHOWDOWN_T) | (layout.kind == CHECKDOWN_T))
+  leaf = np.flatnonzero(layout.kind == MATRIX_T)
+  if (fold.size + show.size + leaf.size != layout.n_terminals
+      or not layout.const[fold].all() or layout.const[show].any()
+      or not layout.stake[show].all() or layout.stake[fold].any()
+      or layout.const[leaf].any() or layout.stake[leaf].any()):
     raise AssertionError(
-      "every terminal must have exactly one of const/stake non-zero; got "
-      f"{fold.size} fold + {show.size} showdown for {layout.n_terminals} terminals"
+      "fold terminals must carry only a const, showdowns only a stake and matrix "
+      f"leaves neither; got {fold.size} fold + {show.size} showdown + "
+      f"{leaf.size} leaf for {layout.n_terminals} terminals"
     )
-  perm = np.concatenate([fold, show])
+  perm = np.concatenate([fold, show, leaf])
   inv = np.empty(perm.size, np.int32)
   inv[perm] = np.arange(perm.size, dtype=np.int32)
-  return fold, show, inv
+  return fold, show, leaf, inv
 
 
 def terminal_cfv(layout: TreeLayout, ev, r_opp, player, mask=MASK):
@@ -198,7 +251,7 @@ def terminal_cfv(layout: TreeLayout, ev, r_opp, player, mask=MASK):
   half its FLOPs multiplying by zero. They come back concatenated by kind and one
   gather restores discovery order.
   """
-  fold, show, inv = _terminal_kinds(layout)
+  fold, show, leaf, inv = _terminal_kinds(layout)
   rows = []
   if fold.size:
     # `const` is chips to player 0, so player 1's view of it is negated.
@@ -209,8 +262,32 @@ def terminal_cfv(layout: TreeLayout, ev, r_opp, player, mask=MASK):
     # both players with no sign flip: player 1's payoff for (b, a) is
     # stake * EV[b, a] == -stake * EV[a, b].
     rows.append(layout.stake[show][:, None] * (r_opp[show] @ ev.T))
+  if leaf.size:
+    rows.append(jnp.zeros((leaf.size, r_opp.shape[1]), r_opp.dtype))
   out = rows[0] if len(rows) == 1 else jnp.concatenate(rows, 0)
   return out[inv]
+
+
+def leaf_positions(layout: TreeLayout) -> np.ndarray:
+  # Discovery-order position of each leaf, in leaf order.
+  pos = np.flatnonzero(layout.leaf_of >= 0)
+  return pos[np.argsort(layout.leaf_of[pos])]
+
+
+def _leaf_terminal_cfv(layout: TreeLayout, leaves: Leaves, tr0, tr1, cfv0_t, cfv1_t):
+  """Fill the matrix-leaf rows of the terminal cfvs.
+
+  Returns the updated ``(cfv0_t, cfv1_t)`` and the per-continuation values
+  ``(q0, q1)``, each ``(n_leaves, n_hands, T)``, which the regret update needs.
+  A player's leaf cfv is their own ``tau``-weighted sum of their ``q``, the same
+  rule as at a decision node they own.
+  """
+  pos = leaf_positions(layout)
+  q0 = leaf_action_cfv(leaves.values, tr1[pos], leaves.tau[1], 0)
+  q1 = leaf_action_cfv(leaves.values, tr0[pos], leaves.tau[0], 1)
+  cfv0_t = cfv0_t.at[pos].set((q0 * leaves.tau[0]).sum(-1))
+  cfv1_t = cfv1_t.at[pos].set((q1 * leaves.tau[1]).sum(-1))
+  return cfv0_t, cfv1_t, q0, q1
 
 
 # ── Traversal ────────────────────────────────────────────────────────────────
@@ -226,9 +303,11 @@ class Traversal(NamedTuple):
   branch: jax.Array   # (n_nodes, n_hands, n_actions) — acting player's children
   term0: jax.Array    # (n_terminals, n_hands) reach at terminals, layout order
   term1: jax.Array
+  leaf_q: jax.Array | None      # (2, n_leaves, n_hands, T) value per continuation
+  leaf_reach: jax.Array | None  # (2, n_leaves, n_hands) own reach at each leaf
 
 
-def _traverse(tree, sigma, ev, r0, r1) -> Traversal:
+def _traverse(tree, sigma, ev, r0, r1, leaves: Leaves | None = None) -> Traversal:
   """Reaches down, all terminals at once, counterfactual values up — by depth.
 
   Every node at a given depth does the identical thing, so each pass is one
@@ -243,6 +322,10 @@ def _traverse(tree, sigma, ev, r0, r1) -> Traversal:
   and the opponent's is a plain sum, because the opponent's probabilities are
   already inside their reach. Illegal edges gather the layout's zero row, so
   they contribute nothing to either and need no masking.
+
+  Matrix leaves are valued from ``leaves``. With ``leaves=None`` they are worth
+  zero, which is only right for checks that ignore values, such as reach
+  conservation; the public entry points refuse a leafy tree without values.
   """
   L = build_layout(tree)
   n_hands, A, dtype = r0.shape[0], L.n_actions, r0.dtype
@@ -268,6 +351,12 @@ def _traverse(tree, sigma, ev, r0, r1) -> Traversal:
   tr0, tr1 = jnp.concatenate(term0, 0), jnp.concatenate(term1, 0)
   cfv0_t = terminal_cfv(L, ev, tr1, 0)
   cfv1_t = terminal_cfv(L, ev, tr0, 1)
+  leaf_q = leaf_reach = None
+  if leaves is not None and len(tree.leaves):
+    cfv0_t, cfv1_t, q0, q1 = _leaf_terminal_cfv(L, leaves, tr0, tr1, cfv0_t, cfv1_t)
+    pos = leaf_positions(L)
+    leaf_q = jnp.stack([q0, q1])
+    leaf_reach = jnp.stack([tr0[pos], tr1[pos]])
 
   # ── up: counterfactual values ──────────────────────────────────────────────
   zero = jnp.zeros((1, n_hands), dtype)
@@ -296,7 +385,7 @@ def _traverse(tree, sigma, ev, r0, r1) -> Traversal:
     reach0=jnp.concatenate(reach0, 0)[back],
     reach1=jnp.concatenate(reach1, 0)[back],
     branch=jnp.concatenate(branch, 0)[back],
-    term0=tr0, term1=tr1,
+    term0=tr0, term1=tr1, leaf_q=leaf_q, leaf_reach=leaf_reach,
   )
 
 
@@ -324,9 +413,24 @@ class _Static:
     return isinstance(other, _Static) and other.value is self.value
 
 
+def _accumulate(regret, delta, ssum, contrib, weight, plus, discount, coef):
+  # The update rule shared by node and leaf tables. Returns the new
+  # (regret, strategy_sum); `coef` holds the DCFR factors of this iteration.
+  regret = regret + delta
+  if plus:
+    regret = jnp.maximum(regret, 0.0)
+  elif discount is not None:
+    pos_d, neg_d, _ = coef
+    regret = jnp.where(regret > 0.0, regret * pos_d, regret * neg_d)
+  ssum = ssum + weight * contrib
+  if discount is not None:
+    ssum = ssum * coef[2]
+  return regret, ssum
+
+
 def _cfr_iteration(
-  tree, tables: Tables, legal, ev, n_hands, update_player, advance, plus, linear,
-  discount,
+  tree, tables: Tables, legal, ev, leaf_values, n_hands, update_player, advance,
+  plus, linear, discount,
 ) -> Tables:
   """One traversal, writing back the tables of ``update_player`` (``-1`` = both).
 
@@ -343,12 +447,15 @@ def _cfr_iteration(
   iteration, not once per traversal.
   """
   sigma = regret_matching_plus(tables.regret, legal)
+  tau = leaf_strategy(tables)
+  leaves = Leaves(leaf_values, tau) if len(tree.leaves) else None
   ones = jnp.ones(n_hands, tables.regret.dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones)
+  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
 
   dtype = tables.regret.dtype
   t = tables.iters + 1
   tf = t.astype(dtype)
+  coef = None
   if discount is None:
     weight = tf if linear else jnp.asarray(1.0, dtype)
   else:
@@ -356,8 +463,7 @@ def _cfr_iteration(
     # contribution goes in unweighted; see Discount for why the add comes first.
     weight = jnp.asarray(1.0, dtype)
     ta, tb = tf ** discount.alpha, tf ** discount.beta
-    pos_d, neg_d = ta / (ta + 1.0), tb / (tb + 1.0)
-    ssum_d = (tf / (tf + 1.0)) ** discount.gamma
+    coef = (ta / (ta + 1.0), tb / (tb + 1.0), (tf / (tf + 1.0)) ** discount.gamma)
 
   # Every node updates the same way, so there is no loop: `is_p0` picks the
   # acting player's row out of the traversal and the rest is elementwise.
@@ -368,15 +474,20 @@ def _cfr_iteration(
   # Illegal actions carry the layout's zero branch value; masking here keeps
   # their regret at exactly 0 rather than at -cfv.
   delta = jnp.where(legal[:, None, :], tv.branch - own_cfv[:, :, None], 0.0)
-  regret = tables.regret + delta
-  if plus:
-    regret = jnp.maximum(regret, 0.0)
-  elif discount is not None:
-    regret = jnp.where(regret > 0.0, regret * pos_d, regret * neg_d)
+  regret, ssum = _accumulate(
+    tables.regret, delta, tables.strategy_sum, own_reach[:, :, None] * sigma,
+    weight, plus, discount, coef,
+  )
 
-  ssum = tables.strategy_sum + weight * own_reach[:, :, None] * sigma
-  if discount is not None:
-    ssum = ssum * ssum_d
+  # At a leaf both players act, so each gets its own regret against its own
+  # tau-weighted value, and its average is weighted by its own reach.
+  leaf_regret, leaf_ssum = tables.leaf_regret, tables.leaf_strategy_sum
+  if leaves is not None:
+    leaf_delta = tv.leaf_q - (tv.leaf_q * tau).sum(-1, keepdims=True)
+    leaf_regret, leaf_ssum = _accumulate(
+      leaf_regret, leaf_delta, leaf_ssum, tv.leaf_reach[..., None] * tau,
+      weight, plus, discount, coef,
+    )
 
   if update_player != -1:
     # Selecting *after* the transforms, not before: a node the other player owns
@@ -385,19 +496,41 @@ def _cfr_iteration(
     mine = jnp.asarray([n.player == update_player for n in tree.nodes])[:, None, None]
     regret = jnp.where(mine, regret, tables.regret)
     ssum = jnp.where(mine, ssum, tables.strategy_sum)
+    mine_leaf = (jnp.arange(2) == update_player)[:, None, None, None]
+    leaf_regret = jnp.where(mine_leaf, leaf_regret, tables.leaf_regret)
+    leaf_ssum = jnp.where(mine_leaf, leaf_ssum, tables.leaf_strategy_sum)
 
-  return Tables(regret, ssum, t if advance else tables.iters)
+  return Tables(regret, ssum, t if advance else tables.iters, leaf_regret, leaf_ssum)
 
 
-@partial(jax.jit, static_argnums=(0, 4, 5, 6, 7, 8, 9))
+@partial(jax.jit, static_argnums=(0, 5, 6, 7, 8, 9, 10))
 def _cfr_iteration_jit(
-  tree_s: _Static, tables, legal, ev, n_hands, update_player, advance, plus, linear,
-  discount,
+  tree_s: _Static, tables, legal, ev, leaf_values, n_hands, update_player, advance,
+  plus, linear, discount,
 ):
   return _cfr_iteration(
-    tree_s.value, tables, legal, ev, n_hands, update_player, advance, plus, linear,
-    discount,
+    tree_s.value, tables, legal, ev, leaf_values, n_hands, update_player, advance,
+    plus, linear, discount,
   )
+
+
+def check_leaves(tree, leaf_values, tables: Tables | None = None):
+  """A tree with matrix leaves needs their values, shaped to match the tables."""
+  n = len(tree.leaves)
+  if n == 0:
+    return
+  if leaf_values is None:
+    raise ValueError(f"the tree has {n} matrix leaves but no leaf_values were given")
+  if leaf_values.shape[0] != n or leaf_values.shape[1] != leaf_values.shape[2]:
+    raise ValueError(
+      f"leaf_values must be (n_leaves={n}, T, T, n_hands, n_hands); "
+      f"got {tuple(leaf_values.shape)}"
+    )
+  if tables is not None and tables.leaf_regret.shape[-1] != leaf_values.shape[1]:
+    raise ValueError(
+      f"tables were built for {tables.leaf_regret.shape[-1]} continuations but "
+      f"leaf_values has {leaf_values.shape[1]}; pass n_transforms to init_tables"
+    )
 
 
 def _check_scheme(plus, linear, discount):
@@ -417,6 +550,7 @@ def _check_scheme(plus, linear, discount):
 def cfr_iteration(
   tree, tables: Tables, legal, ev, n_hands, *, update_player=-1, advance=True,
   plus=False, linear=False, discount: Discount | None = None, jit=True,
+  leaf_values=None,
 ) -> Tables:
   """One CFR traversal over all hands at once, updating ``update_player``.
 
@@ -431,12 +565,16 @@ def cfr_iteration(
   fused graph over ``(regret, strategy_sum, iters)``, ``legal`` and ``ev``. Pass
   ``jit=False`` to run the identical code eagerly, which is what to do when
   stepping through a traversal in a debugger or printing intermediate cfvs.
+
+  ``leaf_values`` is the ``(n_leaves, T, T, n_hands, n_hands)`` payoff tensor of
+  the tree's matrix leaves (see ``leaves.py``); it is traced, like ``ev``.
   """
   if update_player not in (-1, 0, 1):
     raise ValueError(f"update_player must be -1, 0 or 1; got {update_player}")
   _check_scheme(plus, linear, discount)
-  args = (tables, legal, ev, int(n_hands), int(update_player), bool(advance),
-          bool(plus), bool(linear), discount)
+  check_leaves(tree, leaf_values, tables)
+  args = (tables, legal, ev, leaf_values, int(n_hands), int(update_player),
+          bool(advance), bool(plus), bool(linear), discount)
   if not jit:
     return _cfr_iteration(tree, *args)
   return _cfr_iteration_jit(_Static(tree), *args)
@@ -445,6 +583,7 @@ def cfr_iteration(
 def cfr_step(
   tree, tables: Tables, legal, ev, n_hands, *, alternating=False,
   plus=False, linear=False, discount: Discount | None = None, jit=True,
+  leaf_values=None,
 ) -> Tables:
   """One full CFR iteration: every player updated exactly once.
 
@@ -465,7 +604,8 @@ def cfr_step(
   exactly once per full iteration under either update schedule.
   """
   _check_scheme(plus, linear, discount)
-  common = dict(plus=plus, linear=linear, discount=discount, jit=jit)
+  common = dict(plus=plus, linear=linear, discount=discount, jit=jit,
+                leaf_values=leaf_values)
   if not alternating:
     return cfr_iteration(tree, tables, legal, ev, n_hands, update_player=-1, **common)
   tables = cfr_iteration(
@@ -476,21 +616,32 @@ def cfr_step(
   )
 
 
-def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32):
-  """(value to player 0, value to player 1) in chips, chance constant applied."""
+def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32, leaves: Leaves | None = None):
+  """(value to player 0, value to player 1) in chips, chance constant applied.
+
+  ``leaves`` carries the matrix-leaf values and the continuation strategy to
+  play there, typically ``average_leaf_strategy``.
+  """
+  check_leaves(tree, None if leaves is None else leaves.values)
   ones = jnp.ones(n_hands, dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones)
+  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
   return tv.cfv0[tree.root].sum() / N_DEALS, tv.cfv1[tree.root].sum() / N_DEALS
 
 
 # ── Invariants ───────────────────────────────────────────────────────────────
 
 
-def check_zero_sum(tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32):
+def check_zero_sum(
+  tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32, leaves: Leaves | None = None,
+):
   """``Check whether r0 · cfv0(n) + r1 · cfv1(n) == 0`` at every node, including the root.
+
+  With matrix leaves this also checks the sign and transpose of player 1's leaf
+  contraction, which nothing else would catch.
   """
+  check_leaves(tree, None if leaves is None else leaves.values)
   ones = jnp.ones(n_hands, dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones)
+  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
   v0 = (tv.reach0 * tv.cfv0).sum(-1)                      # (n_nodes,)
   v1 = (tv.reach1 * tv.cfv1).sum(-1)
   scale = jnp.maximum(jnp.maximum(jnp.abs(v0), jnp.abs(v1)), 1.0)
@@ -510,7 +661,8 @@ def check_reach_conservation(tree, sigma, n_hands, tol=1e-4, dtype=jnp.float32):
   """``Σ_terminals r0(z)[a] * r1(z)[b]  * r_c(z) [a,b] == 1`` for every hand pair ``(a, b)``.
 
   Checks whether the joint reaches form a valid probability distribution over
-  terminals.
+  terminals. A matrix leaf counts as one terminal: its reach is taken before
+  the continuation choice, whose probabilities sum to one.
   """
   ones = jnp.ones(n_hands, dtype)
   tv = _traverse(tree, sigma, ev_zero(n_hands, dtype), ones, ones)

@@ -47,10 +47,10 @@ from .advantage import retrace
 from .base import Algorithm, TrainingState, applied_learning_rate, inject_learning_rate
 from .rollout import Bootstrap, Rollout, RolloutCarry, collect_rollouts
 from .types import KLDirection, LossType, MagnetUpdateType, MMD_SCHEDULABLE
-from ..agents.base import Agent
-from ..envs.base import Env
+from ...agents.base import Agent
+from ...envs.base import Env
 from ..losses.mmd_q import mmd_q_loss
-from ..policy import policy_probs
+from ...policy import policy_probs
 
 
 class QMMD(Algorithm):

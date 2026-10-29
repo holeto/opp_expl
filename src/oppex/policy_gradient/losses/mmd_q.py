@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from .neurd import estimate_baseline_regrets, neurd_loss
 from .ppo import ppo_policy_loss, ppo_value_loss
 from ..algorithms.types import KLDirection, LossType
-from ..policy import policy_entropy_loss, policy_kl, policy_log_probs, policy_probs
+from ...policy import policy_entropy_loss, policy_kl, policy_log_probs, policy_probs
 
 
 def mmd_q_loss(

@@ -13,3 +13,6 @@ cache/
 
 # Training runs (checkpoints, metrics, exploitability curves).
 checkpoints/
+
+#Local notes
+notes/

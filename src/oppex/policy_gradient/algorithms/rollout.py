@@ -31,8 +31,8 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 
-from ..agents.base import Agent
-from ..envs.base import Env
+from ...agents.base import Agent
+from ...envs.base import Env
 
 
 class Rollout(NamedTuple):

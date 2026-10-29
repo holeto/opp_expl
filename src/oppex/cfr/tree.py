@@ -25,6 +25,12 @@ hands the small blind a free showdown that postflop play would punish, so the
 solver limps far more than any real strategy would. It is a fine debug target but
 **cannot be compared to published push-fold charts** — only ``allow_limp=False``,
 which removes the limp entirely, reproduces the game those charts describe.
+
+``matrix_leaves=True`` replaces that cut with a fourth kind:
+
+* ``MATRIX`` — a depth-limit leaf. Both players simultaneously pick a
+  continuation strategy, and the payoff is a supplied tensor
+  ``V[t0, t1, a, b]`` (see ``leaves.py``). Its ``const`` and ``stake`` are 0.
 """
 
 from __future__ import annotations
@@ -37,8 +43,10 @@ import numpy as np
 from ..envs import betting
 from ..envs.betting import ALL_IN, CALL, FOLD, BettingRules, BettingState
 
-FOLD_T, SHOWDOWN_T, CHECKDOWN_T = 0, 1, 2
-_KIND_NAME = {FOLD_T: "fold", SHOWDOWN_T: "showdown", CHECKDOWN_T: "checkdown"}
+FOLD_T, SHOWDOWN_T, CHECKDOWN_T, MATRIX_T = 0, 1, 2, 3
+_KIND_NAME = {
+  FOLD_T: "fold", SHOWDOWN_T: "showdown", CHECKDOWN_T: "checkdown", MATRIX_T: "matrix",
+}
 _ATOM_NAME = {FOLD: "FOLD", CALL: "CALL", ALL_IN: "ALL_IN"}
 
 
@@ -47,6 +55,7 @@ class TerminalNode(NamedTuple):
   const: float           # chips to player 0, hand-independent (fold terminals)
   stake: float           # chips at risk, multiplied by EV (showdown / checkdown)
   betting: BettingState
+  path: tuple[int, ...]  # atoms from the root, to replay the line in the env
 
 
 class DecisionNode(NamedTuple):
@@ -63,6 +72,11 @@ class PreflopTree(NamedTuple):
   n_actions: int
   root: int
 
+  @property
+  def leaves(self) -> tuple[int, ...]:
+    """Terminal ids of the matrix-valued leaves; leaf ``i`` is ``terminals[leaves[i]]``."""
+    return tuple(j for j, t in enumerate(self.terminals) if t.kind == MATRIX_T)
+
 
 def _key(bs: BettingState):
   """Hashable identity of a public state, for the sibling-collision check."""
@@ -76,7 +90,7 @@ def _key(bs: BettingState):
 
 def build_preflop_tree(
   rules: BettingRules, *, allow_limp: bool = True, max_depth: int = 8,
-  allow_bets: bool = False, max_nodes: int = 100_000,
+  allow_bets: bool = False, max_nodes: int = 100_000, matrix_leaves: bool = False,
 ) -> PreflopTree:
   """Enumerate the preflop public tree.
 
@@ -92,6 +106,9 @@ def build_preflop_tree(
 
   ``max_nodes`` is a tripwire, not a bound anyone should hit: the tree unrolls
   into the jit graph at trace time, so node count is compile time.
+
+  ``matrix_leaves`` turns every checkdown cut into a ``MATRIX`` leaf, whose value
+  is supplied to the solver rather than read off ``EV``.
   """
   if rules.bet_bins.shape[0] != 0 and not allow_bets:
     raise ValueError(
@@ -104,11 +121,11 @@ def build_preflop_tree(
   terminals: list[TerminalNode] = []
   dropped: list[tuple[int, int, int]] = []
 
-  def add_terminal(kind, const, stake, bs) -> tuple[str, int]:
-    terminals.append(TerminalNode(kind, float(const), float(stake), bs))
+  def add_terminal(kind, const, stake, bs, path) -> tuple[str, int]:
+    terminals.append(TerminalNode(kind, float(const), float(stake), bs, path))
     return ("T", len(terminals) - 1)
 
-  def visit(bs: BettingState, depth: int) -> tuple[str, int]:
+  def visit(bs: BettingState, depth: int, path: tuple[int, ...]) -> tuple[str, int]:
     if depth > max_depth:
       raise RuntimeError(f"preflop tree deeper than max_depth={max_depth}")
     slot = len(nodes)
@@ -149,16 +166,18 @@ def build_preflop_tree(
       committed = out.state.committed
       if done and is_fold:
         const = betting.fold_payoffs(committed, bs.cur_player)[0]
-        children[atom] = add_terminal(FOLD_T, const, 0.0, out.state)
+        children[atom] = add_terminal(FOLD_T, const, 0.0, out.state, path + (atom,))
       elif done:
         stake = betting.showdown_payoffs(committed, jnp.int32(1))[0]
-        children[atom] = add_terminal(SHOWDOWN_T, 0.0, stake, out.state)
+        children[atom] = add_terminal(SHOWDOWN_T, 0.0, stake, out.state, path + (atom,))
+      elif advance and matrix_leaves:
+        children[atom] = add_terminal(MATRIX_T, 0.0, 0.0, out.state, path + (atom,))
       elif advance:
         # Preflop betting closed without an all-in: the preflop-only cut.
         stake = betting.showdown_payoffs(committed, jnp.int32(1))[0]
-        children[atom] = add_terminal(CHECKDOWN_T, 0.0, stake, out.state)
+        children[atom] = add_terminal(CHECKDOWN_T, 0.0, stake, out.state, path + (atom,))
       else:
-        children[atom] = visit(out.state, depth + 1)
+        children[atom] = visit(out.state, depth + 1, path + (atom,))
 
     nodes[slot] = DecisionNode(
       player=int(bs.cur_player), legal=tuple(legal),
@@ -166,7 +185,7 @@ def build_preflop_tree(
     )
     return ("D", slot)
 
-  kind, root = visit(betting.initial_state(rules), 0)
+  kind, root = visit(betting.initial_state(rules), 0, ())
   assert kind == "D", "the root must be a decision node"
   if rules.bet_bins.shape[0] == 0 and dropped:
     raise AssertionError(
@@ -185,7 +204,12 @@ def format_tree(tree: PreflopTree) -> str:
     pad = "  " * depth
     if kind == "T":
       t = tree.terminals[i]
-      detail = (f"const={t.const:+g}" if t.kind == FOLD_T else f"stake={t.stake:g}")
+      if t.kind == FOLD_T:
+        detail = f"const={t.const:+g}"
+      elif t.kind == MATRIX_T:
+        detail = f"leaf {tree.leaves.index(i)}"
+      else:
+        detail = f"stake={t.stake:g}"
       lines.append(f"{pad}T{i} {_KIND_NAME[t.kind]:9s} {detail}")
       return
     n = tree.nodes[i]
@@ -249,6 +273,8 @@ class TreeLayout(NamedTuple):
   term_order: np.ndarray       # (n_terminals,) discovery position -> terminal id
   const: np.ndarray            # (n_terminals,) discovery order
   stake: np.ndarray            # (n_terminals,) discovery order
+  kind: np.ndarray             # (n_terminals,) discovery order
+  leaf_of: np.ndarray          # (n_terminals,) discovery order, leaf index or -1
 
 
 def build_layout(tree: PreflopTree) -> TreeLayout:
@@ -308,6 +334,7 @@ def build_layout(tree: PreflopTree) -> TreeLayout:
 
   if len(term_order) != n_term:
     raise AssertionError(f"discovered {len(term_order)} of {n_term} terminals")
+  leaf_id = {j: i for i, j in enumerate(tree.leaves)}
 
   return TreeLayout(
     n_nodes=len(tree.nodes), n_terminals=n_term, n_actions=n_act,
@@ -317,4 +344,6 @@ def build_layout(tree: PreflopTree) -> TreeLayout:
     term_order=np.array(term_order, np.int32),
     const=np.array([tree.terminals[j].const for j in term_order], np.float32),
     stake=np.array([tree.terminals[j].stake for j in term_order], np.float32),
+    kind=np.array([tree.terminals[j].kind for j in term_order], np.int32),
+    leaf_of=np.array([leaf_id.get(j, -1) for j in term_order], np.int32),
   )

@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PhD research code on opponent exploitation in imperfect-information games. Pure-JAX
 environments plus a public-state CFR solver built on them. Early stage: the env layer
-(`oppex.envs`: HUNL, Goofspiel), a preflop push-fold CFR solver (`oppex.cfr`), and a
-policy-gradient baseline (QMMD, ported from the sibling RLG repo) with exact
-exploitability for small games (`oppex.tree`) exist.
+(`oppex.envs`: HUNL, Goofspiel), a preflop push-fold CFR solver (`oppex.cfr`) with
+matrix-valued depth-limit leaves, and a policy-gradient baseline
+(`oppex.policy_gradient`: QMMD, ported from the sibling RLG repo, its Slumbot player and
+the blueprint continuations) with exact exploitability for small games (`oppex.tree`)
+exist.
 
 ## Commands
 
@@ -37,10 +39,11 @@ jaxlib is not installed.
 ### Layering
 
 Docstrings refer to numbered layers ("Layer 3 — Environments" in
-[base.py](src/oppex/envs/base.py), "Layer 5" for `oppex.algorithms`, "Layer 6" for
-`oppex.trainers`); the lowest layers are not written yet. Treat that numbering as the
-intended structure, not as existing code. New layers go in as sibling subpackages of
-`oppex.envs` (`networks`, `agents`, `losses`, `algorithms`, `trainers`, `tree` follow this).
+[base.py](src/oppex/envs/base.py), "Layer 5" for `oppex.policy_gradient.algorithms`,
+"Layer 6" for `oppex.trainers`); the lowest layers are not written yet. Treat that
+numbering as the intended structure, not as existing code. New layers go in as sibling
+subpackages of `oppex.envs` (`networks`, `agents`, `trainers`, `tree` follow this). The
+policy-gradient-specific `algorithms` and `losses` live under `oppex.policy_gradient`.
 
 An earlier design paired the env with a hybrid discrete–continuous policy (a Gaussian
 bet-sizing head trained by an MMD loss in `losses/mmd_cont.py`). **That approach was
@@ -200,8 +203,23 @@ LP, so it cannot be pointed at `allow_limp=True`, where the SB acts twice on the
 `CALL → BB shove → CALL/FOLD` line and the value stops being bilinear in per-hand
 action probabilities. `allow_limp=False` *deletes* the limp action (`legal[CALL] =
 False` at the root) rather than assigning it a payoff. So multi-level traversal is
-currently checked only by the structural invariants, never against an exact
-reference; a sequence-form LP (cheapest on a small synthetic deck) would close that.
+checked against `seqform.py`, the textbook sequence-form LP built straight off the
+tree, which covers `allow_limp=True` too. Use `method="highs-ipm"` for it: the 10 BB
+limp LP takes ~80 s by interior point and over 17 min by simplex.
+
+### Matrix-valued leaves ([leaves.py](src/oppex/cfr/leaves.py))
+
+`build_preflop_tree(..., matrix_leaves=True)` turns each checkdown cut into a `MATRIX`
+depth-limit leaf. There both players **simultaneously** pick one of `T` continuation
+strategies, and the leaf pays `leaf_values[l, t0, t1, a, b]` chips to player 0. The
+tensor is mask-folded like `EV` and is *not* antisymmetric. It must not be split into
+two sequential decision nodes: in a public tree that makes `t0` public. Leaf regrets
+live in `Tables.leaf_regret` `(2, n_leaves, H, T)` and share `_accumulate` with the node
+tables. `seqform.solve(..., leaf_values=)` gives each player one infoset per (leaf,
+hand). The leaf values come from `oppex.policy_gradient.leaf_values` (the QMMD blueprint
+plus Pluribus' fold/call/raise ×5 biases, bucketed by equity). They are verified by
+`scripts/solve_matrix_leaves.py`: degenerate one-continuation leaf == checkdown →
+invariants → sequence-form LP.
 
 ### Env construction
 
@@ -209,7 +227,7 @@ reference; a sequence-form LP (cheapest on a small synthetic deck) would close t
 `build_env(cfg)`, which pops `name` and forwards the rest as kwargs. Register new
 environments there.
 
-## RL training — QMMD ([src/oppex/algorithms/](src/oppex/algorithms/))
+## RL training — QMMD ([src/oppex/policy_gradient/algorithms/](src/oppex/policy_gradient/algorithms/))
 
 Ported from RLG `algorithms/mmd_q.py` (`QMMD`): Magnetic Mirror Descent with a policy head
 and a Q-head (no V-head), Q-targets by Retrace(λ) over the Polyak *target* network's
@@ -234,7 +252,7 @@ evaluated on the training step instead. Only the learning rate is injected into 
 too shifts rounding by an ulp, enough for a run to drift from plain-Adam reruns. Checkpoints
 saved before this change have a different `opt_state` and cannot be resumed.
 
-**Rollouts auto-reset; they do not pad** ([rollout.py](src/oppex/algorithms/rollout.py)).
+**Rollouts auto-reset; they do not pad** ([rollout.py](src/oppex/policy_gradient/algorithms/rollout.py)).
 Each of B rows is a fixed window of T steps over a continuing stream of games: when a game
 ends, a fresh `init_state` is dealt in place (so chance is still drawn once per game). The
 env state at the window's end is carried in `TrainingState` and resumes next iteration.
@@ -259,6 +277,12 @@ only case where the rollout stores `state_reps`.
 Checkpoints are `step_{step:08d}.pkl` pickles of the whole `TrainingState` (RLG saved
 `{counter}.pkl` but resumed from `step_*.pkl`, so its `--resume` never found anything).
 Seed with `jax.random.PRNGKey`, not a typed `jax.random.key`, so state pickles plainly.
+Pickles name classes by module path. `load_checkpoint` rewrites the pre-move
+`oppex.algorithms` / `oppex.losses` paths, so checkpoints from before the move still load.
+
+**Slumbot and the blueprint.** `oppex.policy_gradient.blueprint.Blueprint` loads a run
+directory as a playing policy, and `slumbot/` plays it against Slumbot over HTTP
+(`scripts/policy_gradient/play_slumbot.py`, `analyze_slumbot.py` are thin CLIs).
 
 **Validation.** `oppex.tree` (RLG `src/tree`) enumerates the full history tree of small
 games and computes exact best responses; `scripts/eval_exploitability.py` reports NashConv

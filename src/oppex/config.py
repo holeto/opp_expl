@@ -12,7 +12,7 @@ from typing import Any
 import optax
 
 from .agents import PolicyQAgent, PrivilegedPolicyQAgent
-from .algorithms import QMMD, inject_learning_rate
+from .policy_gradient.algorithms import QMMD, inject_learning_rate
 from .envs import build_env
 from .networks import build_network
 

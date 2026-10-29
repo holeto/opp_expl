@@ -44,6 +44,16 @@ The empty sequence is kept as an explicit variable pinned to 1 by its own equali
 row, rather than substituted out. That keeps every terminal uniformly bilinear:
 terminals where one player never acted (an immediate fold) would otherwise be
 linear terms needing separate handling.
+
+**Matrix-valued leaves** fit the formulation directly. At leaf ``l`` each
+player has one information set per hand, whose ``T`` actions are the
+continuations, extending that player's own sequence into the leaf. Neither
+player's constraint mentions the other's choice, which is exactly what makes
+the choice simultaneous. Every pair ``(t0, t1)`` is a terminal with block
+
+    matrix leaf        values[l, t0, t1] / N_DEALS
+
+already mask-folded, like ``EV``.
 """
 
 from __future__ import annotations
@@ -59,46 +69,74 @@ from .tree import PreflopTree
 
 
 class SequenceForm(NamedTuple):
-  """Sequence indices and constraint matrices for one built tree."""
+  """Sequence indices and constraint matrices for one built tree.
+
+  A public infoset is a decision node or one player's side of a matrix leaf;
+  the latter is keyed ``("leaf", i)`` wherever a node id would go.
+  """
 
   n_seq: tuple[int, int]          # public sequences per player, index 0 = empty
   seq_of: dict                    # (player, node_id, atom) -> public sequence index
-  parent_seq: dict                # node_id -> the owner's sequence leading into it
-  terminals: list                 # (seq0, seq1, const, stake)
+  parent_seq: dict                # (player, node_id) -> owner's sequence leading in
+  terminals: list                 # (seq0, seq1, const, stake, (leaf, t0, t1) | None)
   n_hands: int
+  infosets: tuple[list, list]     # per player: (node_id, parent seq, child seqs)
 
 
 # ── Tree walk ────────────────────────────────────────────────────────────────
 
 
-def enumerate_sequences(tree: PreflopTree, n_hands: int) -> SequenceForm:
-  """Assign a public sequence index to every (decision node, legal action) edge."""
+def enumerate_sequences(
+  tree: PreflopTree, n_hands: int, n_transforms: int = 0,
+) -> SequenceForm:
+  """Assign a public sequence index to every (public infoset, legal action) edge.
+
+  ``n_transforms`` is the number of continuations at each matrix leaf.
+  """
+  if tree.leaves and n_transforms <= 0:
+    raise ValueError("the tree has matrix leaves; pass their n_transforms")
   n_pub = [1, 1]                                   # index 0 is the empty sequence
   seq_of: dict = {}
   parent_seq: dict = {}
   terminals: list = []
+  infosets: tuple[list, list] = ([], [])
+  leaf_id = {j: i for i, j in enumerate(tree.leaves)}
+
+  def new_infoset(p, key, actions, cur):
+    # Allocates one sequence per action, extending player p's sequence `cur`.
+    parent_seq[(p, key)] = cur
+    children = []
+    for a in actions:
+      seq_of[(p, key, a)] = n_pub[p]
+      children.append(n_pub[p])
+      n_pub[p] += 1
+    infosets[p].append((key, cur, children))
+    return children
 
   def walk(ref, cur):
     kind, i = ref
     if kind == "T":
       t = tree.terminals[i]
-      terminals.append((cur[0], cur[1], t.const, t.stake))
+      if i not in leaf_id:
+        terminals.append((cur[0], cur[1], t.const, t.stake, None))
+        return
+      key = ("leaf", leaf_id[i])
+      s0 = new_infoset(0, key, range(n_transforms), cur[0])
+      s1 = new_infoset(1, key, range(n_transforms), cur[1])
+      for t0 in range(n_transforms):
+        for t1 in range(n_transforms):
+          terminals.append((s0[t0], s1[t1], 0.0, 0.0, (leaf_id[i], t0, t1)))
       return
     node = tree.nodes[i]
     p = node.player
-    parent_seq[i] = cur[p]        # the owner's sequence on the way in
-    for atom, child in enumerate(node.child):
-      if child is None:
-        continue
-      s = n_pub[p]
-      n_pub[p] += 1
-      seq_of[(p, i, atom)] = s
+    legal = [a for a, c in enumerate(node.child) if c is not None]
+    for a, s in zip(legal, new_infoset(p, i, legal, cur[p])):
       nxt = list(cur)
       nxt[p] = s
-      walk(child, nxt)
+      walk(node.child[a], nxt)
 
   walk(("D", tree.root), [0, 0])
-  return SequenceForm(tuple(n_pub), seq_of, parent_seq, terminals, n_hands)
+  return SequenceForm(tuple(n_pub), seq_of, parent_seq, terminals, n_hands, infosets)
 
 
 def constraint_matrices(tree: PreflopTree, sf: SequenceForm, player: int):
@@ -107,38 +145,32 @@ def constraint_matrices(tree: PreflopTree, sf: SequenceForm, player: int):
   Variables are flattened as ``sequence * n_hands + hand``. Two kinds of row:
 
   * ``r(empty, h) = 1`` — one per hand, pinning the root realisation.
-  * ``Σ_a r(σ_I·a, h) - r(σ_I, h) = 0`` — one per (decision node, hand), which is
-    the sequence-form equality verbatim.
+  * ``Σ_a r(σ_I·a, h) - r(σ_I, h) = 0`` — one per (public infoset, hand), which
+    is the sequence-form equality verbatim.
   """
   h = sf.n_hands
   n_var = sf.n_seq[player] * h
-  #Eye matrix, as each public state has n_hands infosets in it
+  # Each public infoset holds n_hands private ones, hence identity blocks.
   ident = csr_matrix(np.eye(h))
   rows, rhs = [], []
 
-  # r(empty, ·) = 1
+  # Each root infoset has realisation 1.
   blocks = [None] * sf.n_seq[player]
   blocks[0] = ident
-  #Each of the root infosets has realization plan of 1
   rows.append(_row_block(blocks, h))
   rhs.append(np.ones(h))
 
-  for i, node in enumerate(tree.nodes):
-    if node.player != player:
-      continue
+  for key, parent, children in sf.infosets[player]:
     blocks = [None] * sf.n_seq[player]
-    for atom, child in enumerate(node.child):
-      if child is None:
-        continue
-      blocks[sf.seq_of[(player, i, atom)]] = ident
+    for c in children:
+      blocks[c] = ident
     # `enumerate_sequences` hands out strictly increasing indices as it descends,
-    # and the sequence leading *into* a node is allocated at an ancestor (or is
-    # the empty sequence 0), so it is always strictly below every sequence
-    # leading out. A collision would mean the node is reachable from itself —
+    # and the sequence leading *into* an infoset is allocated at an ancestor (or
+    # is the empty sequence 0), so it is always strictly below every sequence
+    # leading out. A collision would mean the infoset is reachable from itself —
     # a cycle rather than a tree — so assert it instead of merging blocks.
-    parent = sf.parent_seq[i]
     assert blocks[parent] is None, (
-      f"node {i}: incoming sequence {parent} is also one of its outgoing "
+      f"infoset {key}: incoming sequence {parent} is also one of its outgoing "
       "sequences, so the tree contains a cycle"
     )
     blocks[parent] = -ident
@@ -156,7 +188,7 @@ def _row_block(blocks, h):
   return hstack([zero if b is None else b for b in blocks], format="csr")
 
 
-def payoff_matrix(sf: SequenceForm, ev: np.ndarray):
+def payoff_matrix(sf: SequenceForm, ev: np.ndarray, leaf_values=None):
   """``A`` with one dense ``(n_hands, n_hands)`` block per terminal.
 
   Rows are player 0's sequences, columns player 1's, both flattened by hand. The
@@ -167,8 +199,12 @@ def payoff_matrix(sf: SequenceForm, ev: np.ndarray):
   m_ev = mask * np.asarray(ev, dtype=np.float64)
 
   grid = [[None] * sf.n_seq[1] for _ in range(sf.n_seq[0])]
-  for s0, s1, const, stake in sf.terminals:
-    block = (const * mask + stake * m_ev) / N_DEALS
+  for s0, s1, const, stake, leaf in sf.terminals:
+    if leaf is None:
+      block = (const * mask + stake * m_ev) / N_DEALS
+    else:
+      # Leaf values are mask-folded already, so no second mask here.
+      block = np.asarray(leaf_values[leaf], np.float64) / N_DEALS
     grid[s0][s1] = block if grid[s0][s1] is None else grid[s0][s1] + block
 
   zero = csr_matrix((h, h))
@@ -179,15 +215,22 @@ def payoff_matrix(sf: SequenceForm, ev: np.ndarray):
 # ── Solve ────────────────────────────────────────────────────────────────────
 
 
-def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "highs"):
+def solve(
+  tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "highs",
+  leaf_values=None,
+):
   """Exact Nash equilibrium of ``tree`` by sequence-form LP.
 
-  Returns ``(value_to_player0_chips, realisation_0, realisation_1)``, where each
-  realisation plan is shaped ``(n_public_sequences, n_hands)``. Behavioural
+  Returns ``(value_to_player0_chips, realisation_0, realisation_1, sf)``, where
+  each realisation plan is shaped ``(n_public_sequences, n_hands)``. Behavioural
   probabilities come from dividing a sequence by its parent — see
-  ``behaviour_strategy``.
+  ``behaviour_strategy``. ``leaf_values`` is required when the tree has matrix
+  leaves, shaped ``(n_leaves, T, T, n_hands, n_hands)``.
   """
-  sf = enumerate_sequences(tree, n_hands)
+  if tree.leaves and leaf_values is None:
+    raise ValueError(f"the tree has {len(tree.leaves)} matrix leaves but no leaf_values")
+  n_t = 0 if leaf_values is None else int(np.shape(leaf_values)[1])
+  sf = enumerate_sequences(tree, n_hands, n_t)
   E0, e0 = constraint_matrices(tree, sf, 0)
   E1, e1 = constraint_matrices(tree, sf, 1)
   #Matrix is unoptimized, containing 
@@ -195,7 +238,7 @@ def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "hig
   # This just for ease of implementation of the 
   # cases where small blind folds where big blind 
   # did not take an action yet.
-  A = payoff_matrix(sf, ev)
+  A = payoff_matrix(sf, ev, leaf_values)
 
   n_x, n_q = A.shape[0], E1.shape[0]
   # max f^T q  s.t.  F^T q - A^T x <= 0,  E x = e,  x >= 0
@@ -213,49 +256,46 @@ def solve(tree: PreflopTree, ev: np.ndarray, n_hands: int, *, method: str = "hig
   # Player 1's realisation plan is the dual of the inequality block.
   y = np.clip(-np.asarray(res.ineqlin.marginals), 0.0, None).reshape(sf.n_seq[1], n_hands)
   value = float(-res.fun)
-  _check_realisation(tree, sf, x, 0)
-  _check_realisation(tree, sf, y, 1)
+  _check_realisation(sf, x, 0)
+  _check_realisation(sf, y, 1)
   return value, x, y, sf
 
 
 def behaviour_strategy(tree, sf: SequenceForm, r: np.ndarray, player: int) -> dict:
-  """Per-node behavioural probabilities ``(n_hands, n_actions)`` from a plan.
+  """Per-infoset behavioural probabilities ``(n_hands, n_actions)`` from a plan.
 
   ``sigma(a | I) = r(σ_I · a) / r(σ_I)``, uniform where the infoset is unreached
   (realisation zero), which is the standard convention — the strategy there is
-  unconstrained by the equilibrium.
+  unconstrained by the equilibrium. Keys are node ids, and ``("leaf", i)`` for
+  matrix leaves, whose columns are the continuations.
   """
   out = {}
-  for i, node in enumerate(tree.nodes):
-    if node.player != player:
-      continue
-    legal = [a for a, c in enumerate(node.child) if c is not None]
-    parent = r[sf.parent_seq[i]]                       # (n_hands,)
-    sigma = np.zeros((sf.n_hands, tree.n_actions))
-    for a in legal:
-      sigma[:, a] = r[sf.seq_of[(player, i, a)]]
+  for key, parent_s, children in sf.infosets[player]:
+    width = tree.n_actions if isinstance(key, int) else len(children)
+    actions = [a for (p, k, a) in sf.seq_of if p == player and k == key]
+    parent = r[parent_s]                               # (n_hands,)
+    sigma = np.zeros((sf.n_hands, width))
+    for a in actions:
+      sigma[:, a] = r[sf.seq_of[(player, key, a)]]
     denom = np.where(parent > 1e-12, parent, 1.0)[:, None]
     sigma = np.where(parent[:, None] > 1e-12, sigma / denom, 0.0)
     unreached = parent <= 1e-12
     if unreached.any():
-      for a in legal:
-        sigma[unreached, a] = 1.0 / len(legal)
-    out[i] = sigma
+      for a in actions:
+        sigma[unreached, a] = 1.0 / len(actions)
+    out[key] = sigma
   return out
 
 
-def _check_realisation(tree, sf, r, player, tol=1e-6):
+def _check_realisation(sf, r, player, tol=1e-6):
   """Assert the sequence-form equalities actually hold in the returned plan."""
   err = float(np.abs(r[0] - 1.0).max())
   assert err <= tol, f"player {player} empty sequence != 1 (max {err:.3e})"
-  for i, node in enumerate(tree.nodes):
-    if node.player != player:
-      continue
-    total = sum(r[sf.seq_of[(player, i, a)]]
-                for a, c in enumerate(node.child) if c is not None)
-    err = float(np.abs(total - r[sf.parent_seq[i]]).max())
+  for key, parent, children in sf.infosets[player]:
+    total = sum(r[c] for c in children)
+    err = float(np.abs(total - r[parent]).max())
     assert err <= tol, (
-      f"player {player} node {i}: actions sum to {err:.3e} away from the parent "
-      "realisation"
+      f"player {player} infoset {key}: actions sum to {err:.3e} away from the "
+      "parent realisation"
     )
   assert r.min() >= -tol, f"player {player} realisation has negative entries"
