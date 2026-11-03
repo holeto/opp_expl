@@ -221,6 +221,73 @@ plus Pluribus' fold/call/raise ×5 biases, bucketed by equity). They are verifie
 `scripts/solve_matrix_leaves.py`: degenerate one-continuation leaf == checkdown →
 invariants → sequence-form LP.
 
+### Fixed opponent ([solver.py](src/oppex/cfr/solver.py), [exploiter.py](src/oppex/policy_gradient/exploiter.py))
+
+`cfr_step(..., fixed_player=p)` updates only `1 - p`, so it converges to a best
+response rather than to an equilibrium. The fixed strategy lives in the ordinary tables:
+`fix_strategy` writes `sigma` into `p`'s regret **and** strategy-sum rows. Regret
+matching returns a normalised non-negative vector unchanged, so the traversal needs
+no new branch and `average_strategy` returns the full profile. Those rows are never
+written back, and `scripts/solve_fixed_opponent.py` asserts they are bit-identical
+at the end. Its convergence check is the exact `exploit.best_response` against the
+same frozen profile. The gap must go to 0.
+
+At matrix leaves the fixed player has **one continuation**. This is encoded by shape: a
+leaf tensor with a size-1 continuation axis means the payoff ignores that player's
+`t`, so their `tau` drops out (`leaf_action_cfv`). `check_leaves` accepts `T0 == 1`
+or `T1 == 1`.
+
+The real target is the blueprint's own preflop abstraction (`env.rules`, 4 bins,
+`allow_limp=True`): 2192 nodes, 1095 leaves. Dense leaves would be 28 MB per leaf even
+with one continuation, so `leaves.BucketedValues` stores bucket-pair means
+**unmasked** and applies card removal in the contraction, by inclusion–exclusion
+over the two own cards at bucket level (`all − holding d1 − holding d2 + self`).
+That way nothing is built per hand pair: 0.06 s per iteration for both players
+against 0.5 s via a masked `(H, L, T, K)` tensor. It is checked against the dense
+contraction. `allow_limp=False` deletes every non-closing CALL, so a tree with
+bet atoms has no leaves at all. `blueprint_tree_strategy` reads the network off the tree and
+folds struck duplicate atoms into their survivor via `DecisionNode.alias`.
+`ExploiterPolicy` plays the solution: the CFR average preflop, a continuation drawn
+from `tau` at the leaf, and the biased blueprint postflop. It runs in a batched env
+match against the blueprint (with a paired blueprint-vs-blueprint control) and in
+the Slumbot loop (`play_slumbot.py --exploiter`). Slumbot's strategy is unknown, so
+against Slumbot it plays the exploit of MMD.
+
+### Re-solving ([subgame.py](src/oppex/cfr/subgame.py), [infoset_cfr.py](src/oppex/cfr/infoset_cfr.py), [resolving.py](src/oppex/policy_gradient/resolving.py))
+
+Full-game play against the fixed blueprint. At each of our decisions not covered by
+the current subgame, `build_subgame` enumerates `depth` plies (default 4, two of our
+moves) below the current state. Matrix leaves go at the depth limit and at every street
+close, so **a subgame has no chance nodes**: the next card is sampled inside the leaf
+rollouts, and the next street starts a new solve. Most lines close a street within two
+plies, so most decisions are re-solved and only a minority are reused.
+
+**No gadget, and one own hand.** Against a fixed opponent the game is a decision
+problem for us. The root is our infoset: our hand plus `r_o(h)`, the blueprint's
+probability of the opponent's history for each of their hands, times card
+compatibility. Every terminal and leaf contracts against `r_o` to a scalar, and
+`infoset_cfr` is PSCFR with a hand axis of size 1. It shares `solver._accumulate`.
+`best_response` is the exact solution, used for the convergence gap. The opponent model
+is ε-mixed (`eps=1e-3`) so that an off-model Slumbot action cannot zero the belief.
+Duplicate bet atoms are folded through `alias` everywhere, because only the public state
+is observed.
+
+Leaf values are rollouts: `h ~ r_o(l,·)`, the unknown cards drawn from the deck, and
+our seat plays `blueprint ∘ t`. Common random numbers are shared across leaves and `t`.
+Leaves below `min_mass` of the root's opponent mass are valued 0, and a cached node below
+it is re-solved rather than played. Showdowns use `EV[ours]` preflop and
+`equity.sign_vs_range` (exact runout enumeration) on a board.
+
+`build_subgame` with no depth limit from the preflop root reproduces
+`build_preflop_tree` node for node, 30-50x faster (one jitted call per node).
+`scripts/resolve_fixed_opponent.py` checks that the single-hand best response equals
+PSCFR's per-hand BR (`exploit.best_response(per_hand=True)`) on the cached bucketed
+leaves, that re-rooting with the history belief reproduces node values, and that bucket
+averages of the rollout values match the uniform-deal leaf sample. Do not compare one
+hand's rollout value with the bucketed cache: a bucket mean is far from its best hands.
+`--play N` runs the env match with a paired blueprint control. For Slumbot use
+`play_slumbot.py --resolve`.
+
 ### Env construction
 
 [envs/\_\_init\_\_.py](src/oppex/envs/__init__.py) holds a name→class `_REGISTRY` and

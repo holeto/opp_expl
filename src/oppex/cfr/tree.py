@@ -63,6 +63,12 @@ class DecisionNode(NamedTuple):
   legal: tuple[bool, ...]
   child: tuple[tuple[str, int] | None, ...]   # ("D", i) | ("T", j) | None if illegal
   betting: BettingState
+  path: tuple[int, ...]  # atoms from the root, to replay the line in the env
+  # Per atom, the tree atom it is played as: itself if legal in the tree, the
+  # surviving sibling if it was struck as a duplicate, -1 if it is illegal in
+  # the env or was removed (the limp under allow_limp=False). Maps an env
+  # player's atom onto the tree.
+  alias: tuple[int, ...]
 
 
 class PreflopTree(NamedTuple):
@@ -76,6 +82,11 @@ class PreflopTree(NamedTuple):
   def leaves(self) -> tuple[int, ...]:
     """Terminal ids of the matrix-valued leaves; leaf ``i`` is ``terminals[leaves[i]]``."""
     return tuple(j for j, t in enumerate(self.terminals) if t.kind == MATRIX_T)
+
+
+# Any public betting tree, also the depth-limited subgames of ``subgame.py``;
+# nothing in the type is specific to preflop.
+PublicTree = PreflopTree
 
 
 def _key(bs: BettingState):
@@ -136,6 +147,7 @@ def build_preflop_tree(
       betting.legal_atoms(rules, bs, drop_duplicate_allin=True)
     ).tolist()
     children: list[tuple[str, int] | None] = [None] * n_actions
+    alias = [a if ok else -1 for a, ok in enumerate(legal)]
     seen: dict = {}
 
     for atom in range(n_actions):
@@ -146,6 +158,7 @@ def build_preflop_tree(
 
       if allow_limp is False and atom == CALL and not done:
         legal[atom] = False        # the limp is what makes this not a shove-fold game
+        alias[atom] = -1
         continue
 
       # Two sibling edges reaching the same public state ARE the same action;
@@ -159,6 +172,7 @@ def build_preflop_tree(
       k = _key(out.state)
       if k in seen:
         legal[atom] = False
+        alias[atom] = seen[k]
         dropped.append((slot, seen[k], atom))
         continue
       seen[k] = atom
@@ -181,7 +195,7 @@ def build_preflop_tree(
 
     nodes[slot] = DecisionNode(
       player=int(bs.cur_player), legal=tuple(legal),
-      child=tuple(children), betting=bs,
+      child=tuple(children), betting=bs, path=path, alias=tuple(alias),
     )
     return ("D", slot)
 
@@ -193,6 +207,35 @@ def build_preflop_tree(
       f"create them — this is a betting-rules bug, not a bin collision: {dropped}"
     )
   return PreflopTree(rules, tuple(nodes), tuple(terminals), n_actions, root)
+
+
+class TreeTables(NamedTuple):
+  """The tree's edges as int arrays, for tracking a played hand under jit.
+
+  ``next_node[n, a]`` is the decision node reached by tree atom ``a`` at ``n``,
+  ``next_leaf[n, a]`` the matrix leaf reached, both ``-1`` otherwise.
+  ``alias`` is ``DecisionNode.alias`` stacked.
+  """
+
+  next_node: np.ndarray   # (n_nodes, n_actions) int32
+  next_leaf: np.ndarray   # (n_nodes, n_actions) int32
+  alias: np.ndarray       # (n_nodes, n_actions) int32
+
+
+def tree_tables(tree: PreflopTree) -> TreeTables:
+  leaf_id = {j: i for i, j in enumerate(tree.leaves)}
+  shape = (len(tree.nodes), tree.n_actions)
+  next_node, next_leaf = np.full(shape, -1, np.int32), np.full(shape, -1, np.int32)
+  for i, n in enumerate(tree.nodes):
+    for a, ch in enumerate(n.child):
+      if ch is None:
+        continue
+      if ch[0] == "D":
+        next_node[i, a] = ch[1]
+      elif ch[1] in leaf_id:
+        next_leaf[i, a] = leaf_id[ch[1]]
+  alias = np.array([n.alias for n in tree.nodes], np.int32)
+  return TreeTables(next_node, next_leaf, alias)
 
 
 def format_tree(tree: PreflopTree) -> str:

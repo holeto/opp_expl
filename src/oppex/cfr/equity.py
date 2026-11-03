@@ -231,6 +231,63 @@ def _save_checkpoint(ckpt_path, s, c, done):
   tmp.replace(ckpt_path)          # atomic: never leave a half-written checkpoint
 
 
+# ── One hand against every hand, on a known board ────────────────────────────
+
+
+@jax.jit
+def _sign_sums(ours, boards, valid, hands):
+  # Sum of sign(ours vs h) and the number of valid runouts, per hand h, over
+  # the complete boards `boards` (n_chunks, chunk, 5); `valid` masks padding.
+  # A runout counts for h when it shares no card with h; collisions with our
+  # cards are excluded by the caller.
+  rank = jax.vmap(hand_rank7)
+
+  def per_board(board, live):
+    r_us = hand_rank7(jnp.concatenate([ours, board]))
+    seven = jnp.concatenate([hands, jnp.broadcast_to(board, (hands.shape[0], 5))], 1)
+    ok = live & ~(hands[:, :, None] == board[None, None, :]).any((1, 2))
+    sgn = jnp.sign(r_us - rank(seven)).astype(jnp.float32)
+    return jnp.where(ok, sgn, 0.0), ok.astype(jnp.float32)
+
+  def per_chunk(carry, xs):
+    sgn, ok = jax.vmap(per_board)(*xs)
+    return (carry[0] + sgn.sum(0), carry[1] + ok.sum(0)), None
+
+  zero = jnp.zeros(hands.shape[0], jnp.float32)
+  (tot, cnt), _ = jax.lax.scan(per_chunk, (zero, zero), (boards, valid))
+  return tot, cnt
+
+
+def sign_vs_range(our_cards, board) -> np.ndarray:
+  """``(N_HANDS,)`` expected showdown sign of our hand against every hand.
+
+  ``board`` holds the 3, 4 or 5 known cards; every completion of it from the
+  rest of the deck is enumerated (1081 on the flop, 46 on the turn). Like
+  ``EV`` it is net EV per unit stake, and it is 0 for hands sharing a card
+  with ours or the board, so card removal is folded in.
+  """
+  ours = [int(c) for c in our_cards]
+  board = [int(c) for c in board]
+  if len(board) not in (3, 4, 5):
+    raise ValueError(f"a postflop board has 3-5 cards; got {board}")
+  known = set(ours) | set(board)
+  deck = [c for c in range(52) if c not in known]
+  runs = np.array(list(itertools.combinations(deck, 5 - len(board))), np.int32)
+  runs = runs.reshape(len(runs), 5 - len(board))
+  boards = np.concatenate([np.tile(np.asarray(board, np.int32), (len(runs), 1)), runs], 1)
+  # Chunks of boards are vmapped and the chunks scanned; padding is masked.
+  chunk = min(32, len(boards))
+  n_chunks = -(-len(boards) // chunk)
+  valid = np.arange(n_chunks * chunk) < len(boards)
+  boards = np.concatenate([boards, np.repeat(boards[:1], n_chunks * chunk - len(boards), 0)])
+  tot, cnt = _sign_sums(jnp.asarray(ours, jnp.int32),
+                        jnp.asarray(boards.reshape(n_chunks, chunk, 5)),
+                        jnp.asarray(valid.reshape(n_chunks, chunk)), jnp.asarray(HAND_CARDS))
+  tot, cnt = np.asarray(tot, np.float64), np.asarray(cnt, np.float64)
+  clash = np.isin(HAND_CARDS, list(known)).any(1)
+  return np.where(clash | (cnt == 0), 0.0, tot / np.maximum(cnt, 1.0))
+
+
 # ── Validation ───────────────────────────────────────────────────────────────
 
 

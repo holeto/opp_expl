@@ -282,7 +282,8 @@ def play_hand(client: SlumbotClient, agent: TreeAgent, rng: np.random.Generator)
     history = action
 
     if "winnings" in r:
-      return {
+      info = agent.hand_info() if hasattr(agent, "hand_info") else {}
+      return {**info,
         "client_pos": r["client_pos"], "seat": seat, "hole_cards": r["hole_cards"],
         "board": r.get("board", []), "bot_hole_cards": r.get("bot_hole_cards"),
         "action": action, "winnings": r["winnings"], "tree_lost": tree_lost,
@@ -327,6 +328,15 @@ def main() -> None:
   ap.add_argument("run_dir")
   ap.add_argument("--checkpoint", help="checkpoint file (default: latest in run_dir)")
   ap.add_argument("--params", choices=("params", "target", "magnet"), default="params")
+  ap.add_argument("--exploiter", metavar="NPZ",
+                  help="play a fixed-opponent PSCFR solution preflop "
+                       "(scripts/solve_fixed_opponent.py) instead of the blueprint")
+  ap.add_argument("--resolve", action="store_true",
+                  help="re-solve depth-limited subgames against the blueprint as the "
+                       "opponent model (policy_gradient/resolving.py)")
+  ap.add_argument("--depth", type=int, default=4, help="re-solving depth in plies")
+  ap.add_argument("--leaf-games", type=int, default=128, help="rollouts per leaf and t")
+  ap.add_argument("--cfr-iters", type=int, default=500)
   ap.add_argument("--opponent", choices=("slumbot", "random"), default="slumbot",
                   help="random: a local uniformly random opponent (random_opponent.py)")
   ap.add_argument("--hands", type=int, default=10)
@@ -338,10 +348,24 @@ def main() -> None:
   if args.min_interval < 0.5:
     ap.error("--min-interval below 0.5 s would overload the Slumbot server")
 
-  agent = TreeAgent(args.run_dir, args.checkpoint, args.params)
+  if args.resolve:
+    from ...cfr import equity
+    from ..resolving import ResolvingAgent
+    agent = ResolvingAgent(args.run_dir, args.checkpoint, args.params,
+                           equity.preflop_ev_matrix(n_boards=200_000, progress=False),
+                           depth=args.depth, leaf_games=args.leaf_games,
+                           iters=args.cfr_iters, seed=args.seed)
+  elif args.exploiter:
+    # Imported here because exploiter imports this module.
+    from ..exploiter import ExploiterAgent
+    agent = ExploiterAgent(args.run_dir, args.checkpoint, args.params, args.exploiter,
+                           seed=args.seed + 2)
+  else:
+    agent = TreeAgent(args.run_dir, args.checkpoint, args.params)
+  tag = "resolve_" if args.resolve else "exploiter_" if args.exploiter else ""
   out = args.out or os.path.join(
     args.run_dir, args.opponent,
-    f"{args.params}_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl",
+    f"{tag}{args.params}_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl",
   )
   os.makedirs(os.path.dirname(out), exist_ok=True)
   if args.opponent == "random":

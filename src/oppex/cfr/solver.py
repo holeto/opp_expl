@@ -18,8 +18,17 @@ than it did. ``jit=False`` still runs the identical code eagerly.
 
 ``cfr_step`` is the entry point: one call is one full iteration, under either the
 simultaneous or the alternating update schedule. ``cfr_iteration`` underneath it
-is one *traversal*, which is a half-step when alternating — call it directly only
-to update a single player, as in fixed-opponent exploitation.
+is one *traversal*, which is a half-step when alternating.
+
+**Against a fixed opponent** (``cfr_step(..., fixed_player=p)``) only player
+``1 - p`` is updated, which converges to a best response to the fixed strategy
+rather than to an equilibrium. The fixed strategy lives in the ordinary tables:
+``fix_strategy`` writes it into player ``p``'s regret *and* strategy-sum rows,
+and since regret matching returns any normalised non-negative vector unchanged,
+the traversal plays it with no extra branch, and ``average_strategy`` returns
+the full profile (exploiter average plus fixed opponent). The rows are never
+written back, so they stay bit-identical. At matrix leaves the fixed player has
+a single continuation (see ``leaves.py``).
 
 Three things here are easy to get subtly wrong, and each has a guard:
 
@@ -128,6 +137,51 @@ def init_tables(
 def legal_mask(tree: PreflopTree) -> jax.Array:
   """(n_nodes, n_actions) bool — static, straight from the tree."""
   return jnp.asarray([list(n.legal) for n in tree.nodes])
+
+
+def fix_strategy(
+  tree: PreflopTree, tables: Tables, player: int, sigma, tau=None, tol: float = 1e-4,
+) -> Tables:
+  """Freeze ``player`` at the behaviour strategy ``sigma``.
+
+  ``sigma`` is ``(n_nodes, n_hands, n_actions)``; only the rows of ``player``'s
+  nodes are read. It goes into both the regret and the strategy-sum rows, so the
+  current and the average strategy are both ``sigma``. ``tau`` is the player's
+  ``(n_leaves, n_hands, T)`` continuation strategy, by default all mass on
+  continuation 0, the unbiased blueprint. With values whose ``player`` axis has
+  size one it does not affect any payoff, but it is what gets reported.
+
+  Pair it with ``cfr_step(..., fixed_player=player)``, which never writes these
+  rows back.
+  """
+  if player not in (0, 1):
+    raise ValueError(f"player must be 0 or 1; got {player}")
+  legal = np.asarray(legal_mask(tree))
+  mine = np.array([n.player == player for n in tree.nodes])
+  sig = np.asarray(sigma, np.float64)[mine]
+  # Regret matching would silently repair a row that is not a distribution, so
+  # a wrong input must fail here instead.
+  off_legal = np.abs(np.where(legal[mine][:, None, :], 0.0, sig)).max(initial=0.0)
+  row_err = np.abs(sig.sum(-1) - 1.0).max(initial=0.0)
+  if (sig < 0).any() or off_legal > tol or row_err > tol:
+    raise ValueError(
+      f"sigma is not a distribution over legal actions at player {player}'s nodes: "
+      f"mass on illegal actions {off_legal:.2e}, row sums off by {row_err:.2e}"
+    )
+  sel = jnp.asarray(mine)[:, None, None]
+  sigma = jnp.asarray(sigma, tables.regret.dtype)
+  regret = jnp.where(sel, sigma, tables.regret)
+  ssum = jnp.where(sel, sigma, tables.strategy_sum)
+
+  n_leaves, n_t = tables.leaf_regret.shape[1], tables.leaf_regret.shape[-1]
+  if tau is None:
+    tau = jnp.zeros(tables.leaf_regret.shape[1:], tables.regret.dtype).at[..., 0].set(1.0)
+  if n_leaves and tau.shape != tables.leaf_regret.shape[1:]:
+    raise ValueError(f"tau must be {tables.leaf_regret.shape[1:]}; got {tau.shape} "
+                     f"for {n_t} continuations")
+  leaf_regret = tables.leaf_regret.at[player].set(tau)
+  leaf_ssum = tables.leaf_strategy_sum.at[player].set(tau)
+  return Tables(regret, ssum, tables.iters, leaf_regret, leaf_ssum)
 
 
 # ── Strategy ─────────────────────────────────────────────────────────────────
@@ -515,21 +569,27 @@ def _cfr_iteration_jit(
 
 
 def check_leaves(tree, leaf_values, tables: Tables | None = None):
-  """A tree with matrix leaves needs their values, shaped to match the tables."""
+  """A tree with matrix leaves needs their values, shaped to match the tables.
+
+  Either continuation axis may have size one, for a player with a single
+  continuation (a fixed opponent); the other must match the tables.
+  """
   n = len(tree.leaves)
   if n == 0:
     return
   if leaf_values is None:
     raise ValueError(f"the tree has {n} matrix leaves but no leaf_values were given")
-  if leaf_values.shape[0] != n or leaf_values.shape[1] != leaf_values.shape[2]:
+  shape = tuple(leaf_values.shape)
+  t0, t1 = shape[1], shape[2]
+  if shape[0] != n or (t0 != t1 and 1 not in (t0, t1)):
     raise ValueError(
-      f"leaf_values must be (n_leaves={n}, T, T, n_hands, n_hands); "
-      f"got {tuple(leaf_values.shape)}"
+      f"leaf_values must be (n_leaves={n}, T0, T1, n_hands, n_hands) with T0 == T1 "
+      f"or one of them 1; got {shape}"
     )
-  if tables is not None and tables.leaf_regret.shape[-1] != leaf_values.shape[1]:
+  if tables is not None and tables.leaf_regret.shape[-1] != max(t0, t1):
     raise ValueError(
       f"tables were built for {tables.leaf_regret.shape[-1]} continuations but "
-      f"leaf_values has {leaf_values.shape[1]}; pass n_transforms to init_tables"
+      f"leaf_values has {max(t0, t1)}; pass n_transforms to init_tables"
     )
 
 
@@ -583,7 +643,7 @@ def cfr_iteration(
 def cfr_step(
   tree, tables: Tables, legal, ev, n_hands, *, alternating=False,
   plus=False, linear=False, discount: Discount | None = None, jit=True,
-  leaf_values=None,
+  leaf_values=None, fixed_player: int | None = None,
 ) -> Tables:
   """One full CFR iteration: every player updated exactly once.
 
@@ -602,10 +662,21 @@ def cfr_step(
   ``alternating=True, discount=DCFR`` is Discounted CFR. Both legs of an
   alternating step share one ``t``, so each player's accumulators are discounted
   exactly once per full iteration under either update schedule.
+
+  ``fixed_player=p`` skips player ``p``'s update; its tables must have been set
+  by ``fix_strategy``. One traversal updates the other player, so the two
+  schedules coincide and ``alternating`` is irrelevant.
   """
   _check_scheme(plus, linear, discount)
   common = dict(plus=plus, linear=linear, discount=discount, jit=jit,
                 leaf_values=leaf_values)
+  if fixed_player is not None:
+    if fixed_player not in (0, 1):
+      raise ValueError(f"fixed_player must be None, 0 or 1; got {fixed_player}")
+    return cfr_iteration(
+      tree, tables, legal, ev, n_hands, update_player=1 - fixed_player, advance=True,
+      **common,
+    )
   if not alternating:
     return cfr_iteration(tree, tables, legal, ev, n_hands, update_player=-1, **common)
   tables = cfr_iteration(
