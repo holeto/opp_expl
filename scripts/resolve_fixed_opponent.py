@@ -10,7 +10,7 @@ The ladder, cheapest first:
 a. ``build_subgame`` from the preflop root with no depth limit reproduces the
    tree of ``build_preflop_tree``, node for node.
 b. With the bucketed leaf values of the fixed-opponent PSCFR run and no
-   opponent noise (``eps=0``), the single-hand best response from the deal
+   opponent noise, the single-hand best response from the deal
    equals PSCFR's per-hand best-response cfv, for a sample of hands per seat.
    Same game, so any difference is a bug in reaches, card removal, terminals,
    leaves or seats.
@@ -20,7 +20,8 @@ d. CFR's average reaches the best-response value (gap logged on every solve).
 e. Rollout leaf values, averaged over the hands of a bucket, agree with the
    uniform-deal sample of the same leaf, up to Monte Carlo error.
 f. ``--play N`` plays N hands against the blueprint in the env, with a
-   blueprint-vs-blueprint control on the same deals.
+   blueprint-vs-blueprint control on the same deals, and evaluates every hand
+   with AIVAT on per-history subgame values (``resolving_aivat``).
 """
 
 from __future__ import annotations
@@ -41,8 +42,9 @@ from oppex.cfr.subgame import build_subgame
 from oppex.envs import betting
 from oppex.policy_gradient import leaf_values as lv
 from oppex.policy_gradient.blueprint import N_TRANSFORMS, Blueprint
+from oppex.policy_gradient.resolving_aivat import ResolvingAivat, report_aivat
 from oppex.policy_gradient.resolving import (
-  Resolver, bucketed_leaf_values, play_vs_blueprint,
+  Resolver, bucketed_leaf_values, play_vs_blueprint, report_play,
 )
 
 
@@ -81,7 +83,7 @@ def exact_resolver(bp, ev, vb, bucket, tr, seat):
   def leaf_fn(t, r_term, cards, board, s):
     return bucketed_leaf_values(t, r_term, cards, s, vb[seat], bucket, paths)
 
-  return Resolver(bp, ev, depth=None, eps=0.0, iters=200, leaf_fn=leaf_fn)
+  return Resolver(bp, ev, depth=None, iters=200, leaf_fn=leaf_fn)
 
 
 def check_exact(bp, ev, tr, mmd, vb, bucket, n_hands, rng):
@@ -192,8 +194,11 @@ def main():
   ap.add_argument("--depth", type=int, default=4)
   ap.add_argument("--leaf-games", type=int, default=128)
   ap.add_argument("--cfr-iters", type=int, default=500)
-  ap.add_argument("--eps", type=float, default=1e-3)
   ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--no-aivat", action="store_true")
+  ap.add_argument("--no-cover-opponent", action="store_true",
+                  help="skip AIVAT terms for opponent decisions outside every played subgame "
+                       "instead of solving them when reached")
   args = ap.parse_args()
   if args.leaf_file is None:
     args.leaf_file = os.path.join(args.run_dir, "leaf_values",
@@ -220,28 +225,17 @@ def main():
     out = os.path.join(out_dir, f"vs_blueprint_d{args.depth}_n{args.leaf_games}_"
                                 f"it{args.cfr_iters}_s{args.seed}.jsonl")
     res = Resolver(bp, ev, depth=args.depth, leaf_games=args.leaf_games,
-                   iters=args.cfr_iters, eps=args.eps, seed=args.seed)
+                   iters=args.cfr_iters, seed=args.seed)
+    aivat = None
+    if not args.no_aivat:
+      aivat = ResolvingAivat(res, cover_opponent=not args.no_cover_opponent)
     print(f"\nf. {args.play} hands against the blueprint -> {out}")
     with open(out, "w") as f:
-      recs = play_vs_blueprint(bp, res, args.play, seed=args.seed, log=f)
+      recs = play_vs_blueprint(bp, res, args.play, seed=args.seed, log=f, aivat=aivat)
     mbb = 1e3 / bp.env.big_blind
-    pay = np.array([r["payoff"] for r in recs]) * mbb
-    ctl = np.array([r["control"] for r in recs]) * mbb
-    solves = [s for r in recs for s in r["solves"]]
-    se = lambda x: 1.96 * x.std() / np.sqrt(len(x))
-    print(f"  re-solving {pay.mean():+.0f} ± {se(pay):.0f}, control {ctl.mean():+.0f} ± "
-          f"{se(ctl):.0f}, paired difference {(pay - ctl).mean():+.0f} ± {se(pay - ctl):.0f} "
-          "mbb/hand")
-    dec = sum(r["decisions"] for r in recs)
-    print(f"  {dec} decisions, {len(solves)} re-solves ({1 - len(solves) / max(dec, 1):.0%} "
-          f"reused), {np.mean([s['t_total'] for s in solves]):.1f}s per re-solve "
-          f"(leaves {np.mean([s['t_leaves'] for s in solves]):.1f}s), "
-          f"{np.mean([s['leaves'] for s in solves]):.0f} leaves, CFR-BR gap "
-          f"{np.mean([s['gap'] for s in solves]):.3f} chips; truncated hands "
-          f"{np.mean([r['truncated'] for r in recs]):.1%}")
-    for st, name in enumerate(("preflop", "flop", "turn", "river")):
-      n = sum(s["street"] == (0, 3, 4, 5)[st] for s in solves)
-      print(f"  {name:>7}: {n} re-solves")
+    report_play(recs, mbb)
+    if aivat is not None:
+      report_aivat(recs, mbb)
 
 
 if __name__ == "__main__":

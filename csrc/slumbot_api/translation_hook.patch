@@ -1,0 +1,53 @@
+--- a/src/stateless_nl_agent.h
++++ b/src/stateless_nl_agent.h
+@@ -83,6 +83,8 @@
+   double BelowProb(int actual_bet_to, int below_bet_to, int above_bet_to, int actual_pot_size);
+   void Interpret(ActionType action_type, int bet_to, std::vector<Node *> *path, Node *sob_node,
+ 		 int last_bet_to, int opp_bet_amount, bool *forced_all_in, bool *terminate);
++  virtual double TranslationDraw(int hand_index, bool p1_choice, size_t path_size,
++                                 double below_prob);
+   void Translate(ActionType action_type, int bet_to, std::vector<Node *> *path,
+ 		 Node **sob_node, int actual_pot_size, int hand_index);
+   void ProcessActions(vector<Action> *actions, bool p1, int hand_index, vector<Node *> *path,
+--- a/src/translation.cpp
++++ b/src/translation.cpp
+@@ -155,6 +155,17 @@
+   return below_prob;
+ }
+ 
++// The uniform draw that picks between the two abstract sizes bracketing an opponent bet (the
++// below size iff r < below_prob). Virtual so that a caller can supply the draw itself; this
++// default reproduces the original per-translation seeding exactly.
++double StatelessNLAgent::TranslationDraw(int hand_index, bool p1_choice, size_t path_size,
++                                         double below_prob)
++{
++  int seed = hand_index * 967 + (p1_choice ? 23 : 0) + path_size * 7;
++  SeedRand(seed);
++  return RandZeroToOne();
++}
++
+ static bool StreetInitial(Node *node)
+ {
+   return (node->IthSucc(node->CallSuccIndex())->Street() == node->Street());
+@@ -439,9 +450,7 @@
+           double below_prob = BelowProb(actual_opp_bet_to, below_bet_to,
+                                         above_bet_to, actual_pot_size);
+           // See comment below
+-          int seed = hand_index * 967 + (node->P1Choice() ? 23 : 0) + path->size() * 7;
+-          SeedRand(seed);
+-          double r = RandZeroToOne();
++          double r = TranslationDraw(hand_index, node->P1Choice(), path->size(), below_prob);
+ #if 0
+ 	  fprintf(stderr, "hand_index %u p1 %i path sz %i seed %u r %f\n",
+ 		  hand_index, (int)node->P1Choice(), (int)path->size(),
+@@ -515,9 +524,7 @@
+           // each time we get here.  But also don't want my translation to
+           // be deterministic preflop.  So seed the RNG to something based on
+           // the hand index and the action index.
+-          int seed = hand_index * 967 + (node->P1Choice() ? 23 : 0) + path->size() * 7;
+-          SeedRand(seed);
+-          double r = RandZeroToOne();
++          double r = TranslationDraw(hand_index, node->P1Choice(), path->size(), below_prob);
+           if (r < below_prob)
+           {
+             // fprintf(stderr, "Selected below bet; succ %i\n", below_succ);

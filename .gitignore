@@ -16,3 +16,6 @@ checkpoints/
 
 #Local notes
 notes/
+
+# C++ build outputs (csrc/<lib>/build/)
+csrc/*/build/

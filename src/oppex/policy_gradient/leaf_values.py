@@ -48,7 +48,7 @@ import numpy as np
 
 from ..cfr.cards import HAND_CLASS, HAND_INDEX, MASK_NP, N_HANDS, N_OPP
 from ..cfr.leaves import BucketedValues
-from ..policy import policy_probs
+from ..policy import policy_probs, sample_atom
 from .blueprint import (
   BLUEPRINT, N_TRANSFORMS, Blueprint, bias_multipliers, transform_policy,
 )
@@ -97,11 +97,7 @@ def play_out(bp: Blueprint, s, game_keys, t0, t1, mult):
     probs = transform_policy(probs, legal, jnp.where(cur == 0, t0, t1), mult)
 
     u = jax.vmap(lambda k, i: jax.random.uniform(jax.random.fold_in(k, i)))(game_keys, s.step)
-    cdf = jnp.cumsum(probs, -1)
-    atom = jnp.minimum((cdf < u[:, None] * cdf[:, -1:]).sum(-1), env.num_actions - 1)
-    # Rounding at the top of the CDF can land on a trailing illegal atom.
-    ok = jnp.take_along_axis(legal, atom[:, None], -1)[:, 0]
-    atom = jnp.where(ok, atom, probs.argmax(-1))
+    atom = sample_atom(probs, u)
 
     live = active(s)
     new_s, rewards, _, _ = apply_b(s, jnp.stack([atom, atom], -1).astype(jnp.int32))

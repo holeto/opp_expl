@@ -268,7 +268,11 @@ probability of the opponent's history for each of their hands, times card
 compatibility. Every terminal and leaf contracts against `r_o` to a scalar, and
 `infoset_cfr` is PSCFR with a hand axis of size 1. It shares `solver._accumulate`.
 `best_response` is the exact solution, used for the convergence gap. The opponent model
-is ε-mixed (`eps=1e-3`) so that an off-model Slumbot action cannot zero the belief.
+is the blueprint **exactly**, with no ε-exploration: mixing would bias every belief and
+opponent node to cover a case that only arises when the model is wrong. That case is an
+observed action with probability 0 for every remaining hand. `belief` then counts that
+one action as uniform, which leaves the belief unchanged, prints a warning and records
+the step in the solve's `model_failures`.
 Duplicate bet atoms are folded through `alias` everywhere, because only the public state
 is observed.
 
@@ -277,6 +281,23 @@ our seat plays `blueprint ∘ t`. Common random numbers are shared across leaves
 Leaves below `min_mass` of the root's opponent mass are valued 0, and a cached node below
 it is re-solved rather than played. Showdowns use `EV[ours]` preflop and
 `equity.sign_vs_range` (exact runout enumeration) on a board.
+
+**Per-hand leaf rollouts** (`Resolver(..., games_per_hand=g)`) roll out every
+(leaf, opponent hand) pair `g` times and contract against `r_o` exactly, keeping the
+table `V(l, t, h)` on `Solution.leaf_table`. Stratifying by hand removes the
+between-hand noise: on a flop subgame 16 games per hand (≈17k per leaf) gave leaf
+noise 1.15 chips against 1.67 for 4096 ordinary games. Each hand needs its **own**
+runouts (`LeafRollouts(row_keys=True)`, one key per hand, shared across leaves and
+`t`). Sharing them across hands, as the ordinary rollouts' slots are shared across
+leaves, leaves the contraction with the board noise of `g` runouts, correlated over
+leaves. The table does not depend on the belief, so `LeafTableCache` reuses rows for
+any solve reaching the same (seat, our hand, board, leaf path): in memory within a
+hand, and preflop on disk under `leaf_cache_dir/<run>_<params>_step<N>_f<factor>_g<g>`.
+The rollout seed depends only on (seat, our hand, board), so cached and fresh rows are
+bit-identical (the table is float32 for that reason) and evaluation solves that fill
+the cache do not change play. No suit isomorphism: the network is not exactly
+suit-symmetric. Cost on an RTX 4060 Laptop: about 430k games/s (13× the CPU), so a
+cold preflop-root solve at 32 games per hand takes about 5 min and a cached one 7 s.
 
 `build_subgame` with no depth limit from the preflop root reproduces
 `build_preflop_tree` node for node, 30-50x faster (one jitted call per node).
@@ -287,6 +308,39 @@ averages of the rollout values match the uniform-deal leaf sample. Do not compar
 hand's rollout value with the bucketed cache: a bucket mean is far from its best hands.
 `--play N` runs the env match with a paired blueprint control. For Slumbot use
 `play_slumbot.py --resolve`.
+
+**AIVAT on per-history values** ([resolving_aivat.py](src/oppex/policy_gradient/resolving_aivat.py)).
+Before contraction, every subgame terminal pays per opponent hand
+(`resolving.terminal_payoffs`, the single source for both uses). So with the opponent's
+hand `h*` revealed, a reversed sweep gives `Q(n, a, h*)`: `σ` at our nodes,
+`π(·|n, h*)` at theirs, and `Σ_t τ·V(l, t, h*)` at leaves. That replaces the
+Q-head's infoset value and adds terms at the opponent's decisions, since the
+blueprint's `π` is known; this needs the unmixed model.
+- **Recorded during play:** `ṽ(n, ·)` must be fixed before `a*` is drawn, so
+  `play_vs_blueprint` calls `ResolvingAivat.step` at every decision. It computes
+  `Q(n, ·, h*)` then (the evaluator knows `h*`; the player never sees it) and stores it
+  with the sampled distribution. `finish` sums the terms; `rec["aivat"]["nodes"]` keeps
+  every node's record.
+- **Leaf values at `h*`:** rollouts estimate only the belief average, so `V(l, t, h*)` is
+  rolled out again with the opponent's hand fixed, using independent seeds. With
+  per-hand rollouts it is read from the solve's own table instead.
+- **Boards valued by rollouts** (`board_q`, next to the checkdown `board` term, not in
+  `TERMS`): checkdown values a card at the stake when it arrives and misses the betting
+  after it. At the leaf where the street closed, 1024 rollouts with `h*` fixed give the
+  mean over cards and, with the dealt card fixed too, the value of the actual card, on
+  one seed. On 100 identical hands this cut the std from 37.4 to 26.2 BB/hand.
+- **Uncovered opponent decisions:** those outside every played subgame (their first move
+  of a street, the SB's opening when we are BB) get an evaluation-only subgame of
+  `eval_depth=2` when reached.
+- **Cheaper `ṽ`:** any `ṽ` keeps the terms zero-mean, so only accuracy is traded. Only
+  leaves the *current* decision reaches with path weight ≥ `min_weight` are rolled out
+  (cached for later decisions of the same solve), the rest keep the solve's
+  belief-averaged value, and continuations with `τ < min_tau` are dropped. Choosing the
+  leaves from later decisions, as an earlier version did, biases the term: only the
+  played branch has later decisions, so `Q(n, a*)` would depend on `a*`.
+
+Our-decision terms are near 0, because the re-solved average strategy is almost pure.
+The opponent's terms carry the reduction.
 
 ### Env construction
 

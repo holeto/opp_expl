@@ -2,6 +2,7 @@
 
   uv run python scripts/policy_gradient/play_slumbot.py checkpoints/qmmd_hunl_560k --hands 10
   uv run python scripts/policy_gradient/play_slumbot.py checkpoints/qmmd_hunl_560k --opponent random --hands 1000
+  SLUMBOT_DIR=... uv run python scripts/policy_gradient/play_slumbot.py RUN_DIR --resolve --model slumbot --opponent local
   uv run python scripts/policy_gradient/analyze_slumbot.py checkpoints/qmmd_hunl_560k/slumbot/<log>.jsonl
 
 The scripts are thin wrappers around ``main`` here and in ``analyze.py``.
@@ -37,11 +38,17 @@ If the two games ever disagree on whose turn it is or on the street (e.g. we
 call a Slumbot bet of 90% of the stack that the tree read as an all-in, so the
 tree hand is over while the real one goes on), the tree is abandoned for the
 rest of the hand and we check/call down. Such hands are flagged ``tree_lost``.
+
+Both crossings are ``TreeAgent`` methods (``slumbot_atom``, ``our_incr``), so
+an agent with an exact model of Slumbot can replace them
+(``slumbot/agent.py``); ``observe_token`` and ``observe_response`` let it
+follow the real string.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import json
 import os
@@ -205,6 +212,35 @@ class TreeAgent(Blueprint):
       return s
     return s._replace(board=s.board.at[: len(board)].set(jnp.asarray(board, jnp.int32)))
 
+  # ── Crossing between the games ───────────────────────────────────────────
+
+  def slumbot_atom(self, rec: dict, before: RealGame, tree, actor: int,
+                   rng: np.random.Generator) -> int:
+    """The tree atom of Slumbot's action ``rec`` (``RealGame.apply``'s record).
+
+    ``before`` is the real game before the action, ``tree`` the tree state
+    (None once lost). Bets are translated pseudo-harmonically.
+    """
+    if rec["kind"] == "fold":
+      return FOLD
+    if rec["kind"] in ("check", "call"):
+      return CALL
+    if rec["kind"] == "allin":
+      return ALL_IN
+    tr = translate_bet(rec["x"], rec["allin_x"], self.bins, rng)
+    rec["translation"] = tr
+    return tr["atom"]
+
+  def our_incr(self, game: RealGame, seat: int, atom: int, tree) -> tuple[str, int]:
+    """Our tree ``atom`` as (Slumbot incr string, atom played in the tree)."""
+    return real_incr(game, seat, atom, self.bins)
+
+  def observe_token(self, token: str, tree, tree_lost: bool) -> None:
+    """Called after every real token, with the tree after it."""
+
+  def observe_response(self, r: dict) -> None:
+    """Called with every server response, after its tokens were observed."""
+
 
 def atom_name(atom: int, bins: np.ndarray) -> str:
   if atom >= NUM_POINT_ATOMS:
@@ -256,30 +292,23 @@ def play_hand(client: SlumbotClient, agent: TreeAgent, rng: np.random.Generator)
         break
       actor = game.cur
       assert actor != seat, f"unexpected own action in {action!r}"
+      if not tree_lost and (bool(tree.done) or int(tree.cur_player) != actor):
+        tree_lost = True
+      before = copy.deepcopy(game)
       rec = game.apply(kind, to)
       rec.update(who="slumbot", token=kind + (str(to) if to is not None else ""))
-      if rec["kind"] == "fold":
-        atom = FOLD
-      elif rec["kind"] in ("check", "call"):
-        atom = CALL
-      elif rec["kind"] == "allin":
-        atom = ALL_IN
-      else:
-        tr = translate_bet(rec["x"], rec["allin_x"], agent.bins, rng)
-        rec["translation"] = tr
-        atom = tr["atom"]
+      atom = agent.slumbot_atom(rec, before, None if tree_lost else tree, actor, rng)
       if not tree_lost:
-        if bool(tree.done) or int(tree.cur_player) != actor:
-          tree_lost = True
-        else:
-          legal = agent.legal(tree, actor)
-          if not legal[atom]:  # e.g. a raise the tree thinks is impossible
-            atom = ALL_IN if legal[ALL_IN] else CALL
-            rec["tree_adjusted"] = True
-          tree = agent.apply(tree, atom)
+        legal = agent.legal(tree, actor)
+        if not legal[atom]:  # e.g. a raise the tree thinks is impossible
+          atom = ALL_IN if legal[ALL_IN] else CALL
+          rec["tree_adjusted"] = True
+        tree = agent.apply(tree, atom)
+      agent.observe_token(rec["token"], tree, tree_lost)
       rec["tree_atom"] = atom_name(atom, agent.bins)
       events.append(rec)
     history = action
+    agent.observe_response(r)
 
     if "winnings" in r:
       info = agent.hand_info() if hasattr(agent, "hand_info") else {}
@@ -307,7 +336,7 @@ def play_hand(client: SlumbotClient, agent: TreeAgent, rng: np.random.Generator)
       atom = int(rng.choice(len(probs), p=probs / probs.sum()))
       rec.update(probs=[round(float(p), 4) for p in probs], legal=legal.tolist(),
                  tree_pot=float(tree.committed.sum()))
-    incr, played = real_incr(game, seat, atom, agent.bins)
+    incr, played = agent.our_incr(game, seat, atom, None if tree_lost else tree)
     rec.update(atom=atom_name(atom, agent.bins), played=atom_name(played, agent.bins),
                incr=incr)
     kind = incr[0]
@@ -315,6 +344,7 @@ def play_hand(client: SlumbotClient, agent: TreeAgent, rng: np.random.Generator)
     rec.update(kind=real_rec["kind"], add=real_rec["add"], x=real_rec.get("x"))
     if not tree_lost:
       tree = agent.apply(tree, played)
+    agent.observe_token(incr, tree, tree_lost)
     events.append(rec)
     history += incr
     r = client.act(incr)
@@ -334,11 +364,15 @@ def main() -> None:
   ap.add_argument("--resolve", action="store_true",
                   help="re-solve depth-limited subgames against the blueprint as the "
                        "opponent model (policy_gradient/resolving.py)")
+  ap.add_argument("--model", choices=("blueprint", "slumbot"), default="blueprint",
+                  help="--resolve's opponent model: slumbot is Slumbot's exact model "
+                       "(slumbot/agent.py, needs SLUMBOT_DIR)")
   ap.add_argument("--depth", type=int, default=4, help="re-solving depth in plies")
   ap.add_argument("--leaf-games", type=int, default=128, help="rollouts per leaf and t")
   ap.add_argument("--cfr-iters", type=int, default=500)
-  ap.add_argument("--opponent", choices=("slumbot", "random"), default="slumbot",
-                  help="random: a local uniformly random opponent (random_opponent.py)")
+  ap.add_argument("--opponent", choices=("slumbot", "random", "local"), default="slumbot",
+                  help="random: a local uniformly random opponent (random_opponent.py); "
+                       "local: Slumbot from the C++ library (local.py, needs SLUMBOT_DIR)")
   ap.add_argument("--hands", type=int, default=10)
   ap.add_argument("--seed", type=int, default=0)
   ap.add_argument("--min-interval", type=float, default=1.0,
@@ -348,13 +382,18 @@ def main() -> None:
   if args.min_interval < 0.5:
     ap.error("--min-interval below 0.5 s would overload the Slumbot server")
 
+  if args.model == "slumbot" and not args.resolve:
+    ap.error("--model slumbot needs --resolve")
   if args.resolve:
     from ...cfr import equity
     from ..resolving import ResolvingAgent
-    agent = ResolvingAgent(args.run_dir, args.checkpoint, args.params,
-                           equity.preflop_ev_matrix(n_boards=200_000, progress=False),
-                           depth=args.depth, leaf_games=args.leaf_games,
-                           iters=args.cfr_iters, seed=args.seed)
+    cls = ResolvingAgent
+    if args.model == "slumbot":
+      from .agent import SlumbotResolvingAgent as cls
+    agent = cls(args.run_dir, args.checkpoint, args.params,
+                equity.preflop_ev_matrix(n_boards=200_000, progress=False),
+                depth=args.depth, leaf_games=args.leaf_games, iters=args.cfr_iters,
+                seed=args.seed)
   elif args.exploiter:
     # Imported here because exploiter imports this module.
     from ..exploiter import ExploiterAgent
@@ -362,7 +401,8 @@ def main() -> None:
                            seed=args.seed + 2)
   else:
     agent = TreeAgent(args.run_dir, args.checkpoint, args.params)
-  tag = "resolve_" if args.resolve else "exploiter_" if args.exploiter else ""
+  tag = ("resolve_slumbot_" if args.model == "slumbot" else "resolve_" if args.resolve
+         else "exploiter_" if args.exploiter else "")
   out = args.out or os.path.join(
     args.run_dir, args.opponent,
     f"{tag}{args.params}_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl",
@@ -372,6 +412,9 @@ def main() -> None:
     # Imported here because random_opponent imports this module.
     from .random_opponent import RandomOpponent
     client = RandomOpponent(agent.bins, seed=args.seed + 1)
+  elif args.opponent == "local":
+    from .local import LocalSlumbot
+    client = LocalSlumbot(seed=args.seed + 1)
   else:
     client = SlumbotClient(min_interval=args.min_interval)
     username = os.environ.get("SLUMBOT_USERNAME")
@@ -399,6 +442,11 @@ def main() -> None:
             f"{hand['winnings']:+7d}  total {total:+8d}  "
             f"({1000 * total / BIG_BLIND / (h + 1):+.0f} mbb/hand, "
             f"{time.monotonic() - t0:.0f}s, {client.n_requests} requests)", flush=True)
+  if hasattr(agent, "summary"):
+    print(agent.summary(), flush=True)
+  if args.opponent == "local":
+    print(f"local Slumbot: {client.stats['moves']} moves, {len(client.stats['refused'])} "
+          f"refused {client.stats['refused'][:3]}", flush=True)
 
 
 if __name__ == "__main__":
