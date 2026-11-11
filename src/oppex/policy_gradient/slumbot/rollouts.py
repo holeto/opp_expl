@@ -21,6 +21,17 @@ the games where it is to act in one ``sb_act_batch`` call, and applies the
 atoms in another jitted call. Our atoms become tokens and Slumbot's actions
 become atoms through the same functions the model uses (``our_token``,
 ``slumbot_atom``), so rollouts and beliefs read the env the same way.
+
+**What a game pays.** Slumbot's bets are rounded to our bins in the env, so
+the env's chips are not the chips of the hand. By default a game pays the env's
+payoff, which is right when the env is the game being played
+(``resolve_vs_slumbot.py``). With ``real_chips`` it pays what the hand pays on
+slumbot.com, from Slumbot's chip tracker (divided by the scale): the fold or
+showdown there, when Slumbot's string ends. A game stops at that point even if
+the env hand would go on, which it does when Slumbot's whole stack is in but
+the rounded env stacks are not (*all-in drift*). If the env hand ends first,
+the showdown is scored on the chips of the string so far. The blueprint in our
+seat still sees the env's rounded state.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ import numpy as np
 from ...cfr.cards import HAND_CARDS
 from ...envs import betting
 from ...envs.betting import CALL
+from ...envs.hunl_holdem import hand_rank7
 from ...policy import policy_probs, sample_atom
 from ..blueprint import PLURIBUS_FACTOR, bias_multipliers, transform_policy
 from ..resolving import LeafRollouts, make_deal
@@ -65,6 +77,15 @@ def _sample_first_axis(wts: np.ndarray, u: np.ndarray) -> np.ndarray:
   return np.minimum(k, last)
 
 
+def _real_payoff(game, folder: int | None, sign: int, seat: int) -> float:
+  # The finished hand's chips to `seat`, in the tracker's chips. folder: who
+  # folded, or None for a showdown, whose sign is +1 if `seat` wins. A fold
+  # pays the folder's chips; at a showdown an uncalled excess goes back.
+  if folder is not None:
+    return float(-game.committed[seat] if folder == seat else game.committed[1 - seat])
+  return float(sign * min(game.committed))
+
+
 def _advance(game, actions: str, token: str):
   # Slumbot's string and chip tracker after one token, '/' when the street
   # ends. Returns None if the token is illegal in Slumbot's chips.
@@ -81,8 +102,9 @@ class SlumbotRollouts(LeafRollouts):
   """Rollouts valuing ``chunk`` leaves × ``n_games`` per call against Slumbot."""
 
   def __init__(self, bp, model: SlumbotModel, n_games: int = 128, chunk: int = 32,
-               factor: float = PLURIBUS_FACTOR) -> None:
+               factor: float = PLURIBUS_FACTOR, real_chips: bool = False) -> None:
     self.bp, self.model, self.n_games, self.chunk = bp, model, n_games, chunk
+    self.factor, self.real_chips = factor, real_chips
     self.lib = model.lib
     env = bp.env
     rules = env.rules
@@ -129,14 +151,38 @@ class SlumbotRollouts(LeafRollouts):
       new_s, rewards, _, _ = apply_b(s, jnp.stack([atoms, atoms], -1).astype(jnp.int32))
       return where_b(live, new_s, s), jnp.where(live, rewards[:, 0], 0.0)
 
+    @jax.jit
+    def showdown_sign(ours, opp_cards, boards):
+      # +1 if our hand wins each game's showdown, -1 if it loses, 0 on a tie.
+      rank = jax.vmap(lambda hole, b: hand_rank7(jnp.concatenate([hole, b])))
+      ours_b = jnp.broadcast_to(ours, opp_cards.shape)
+      return jnp.sign(rank(ours_b, boards) - rank(opp_cards, boards))
+
     self._start, self._observe, self._apply = start, observe, apply
+    self._showdown_sign = showdown_sign
     # When a list, each chunk appends (leaf paths, h, Slumbot's first atom per
     # game or -1), for validation.
     self.record = None
+    # When a list, each chunk appends (env pay, real pay, scored from real
+    # chips, env and real chips agree at a shared end), for validation.
+    self.record_pay = None
     # refused: (string, status) of the first refusals, for diagnosis.
+    # string_ended: games stopped because Slumbot's string ended while the env
+    # hand went on; env_ended: env hands that ended before Slumbot's string.
     self.stats = {"games": 0, "slumbot_actions": 0, "refusals": 0, "refused": [], "desync": 0,
-                  "dead_leaves": 0,
+                  "dead_leaves": 0, "string_ended": 0, "env_ended": 0,
                   "raise_clamped": 0, "seconds_slumbot": 0.0, "seconds_total": 0.0}
+
+  def resized(self, n_games: int, chunk: int) -> SlumbotRollouts:
+    """These rollouts with ``n_games`` per leaf and ``chunk`` leaves per call.
+
+    They take a board longer than the leaf's street, as AIVAT's boards valued
+    by rollouts need: the deal fixes the extra cards, Slumbot's moves read
+    each game's full board, and the model cuts the board to the street of
+    every query, so the leaf's worlds do not depend on the extra cards. The
+    model is shared, so its caches serve both.
+    """
+    return SlumbotRollouts(self.bp, self.model, n_games, chunk, self.factor, self.real_chips)
 
   def _worlds(self, leaf_paths, board, seat, h, u_world, u_type):
     # Per game: Slumbot's string, chip tracker and translation type, drawn
@@ -179,6 +225,18 @@ class SlumbotRollouts(LeafRollouts):
     opp_cards = HAND_CARDS[h]
     strings, games, u, dead = self._worlds(leaf_paths, board, seat, h, u_world, u_type)
     payoff = np.zeros(len(h))
+    # With real_chips: games whose real payoff is fixed, the payoffs, and games
+    # whose tracker is unusable after an illegal token, which keep the env's.
+    scored, broken = np.zeros(len(h), bool), np.zeros(len(h), bool)
+    real_pay = np.zeros(len(h))
+    sign = None
+    if self.real_chips:
+      sign = np.asarray(self._showdown_sign(ours, jnp.asarray(opp_cards), jnp.asarray(boards)))
+      # A world can already be over at the leaf: drift inside the subgame.
+      for g in np.flatnonzero(~dead):
+        if games[g].done:
+          real_pay[g], scored[g] = _real_payoff(games[g], None, int(sign[g]), seat), True
+          self.stats["string_ended"] += 1
     raise_atoms = np.arange(self.bp.env.num_actions) >= 2
     first = np.full(len(h), -1)
     t_slumbot = 0.0
@@ -186,7 +244,7 @@ class SlumbotRollouts(LeafRollouts):
     while True:
       cur, live, our_atom, legal, totals, smax, u_step = map(
         np.asarray, self._observe(s, game_keys, t))
-      live = live & ~dead
+      live = live & ~dead & ~scored
       if not live.any():
         break
       atoms = our_atom.astype(np.int32)
@@ -222,19 +280,39 @@ class SlumbotRollouts(LeafRollouts):
         first[new] = atoms[new]
       s, rew = self._apply(s, jnp.asarray(atoms), jnp.asarray(live))
       payoff += np.asarray(rew, np.float64)
+      env_over = np.asarray(s.done)
       for g, tok in tokens.items():
         nxt = _advance(games[g], strings[g], tok)
         if nxt is None:
           self.stats["desync"] += 1
-        else:
-          games[g], strings[g] = nxt
+          broken[g] = True
+          continue
+        games[g], strings[g] = nxt
+        if self.real_chips and games[g].done:
+          folder = int(cur[g]) if tok == "f" else None
+          real_pay[g], scored[g] = _real_payoff(games[g], folder, int(sign[g]), seat), True
+          self.stats["string_ended"] += int(not env_over[g])
 
     env = self.bp.env
     pay = payoff * env.starting_stack * (1.0 if seat == 0 else -1.0)
+    env_done = np.asarray(s.done)
+    if self.real_chips:
+      # The env hand ended first: no fold, since a fold ends the string too.
+      for g in np.flatnonzero(env_done & ~scored & ~dead & ~broken):
+        real_pay[g], scored[g] = _real_payoff(games[g], None, int(sign[g]), seat), True
+        self.stats["env_ended"] += 1
+      if self.record_pay is not None:
+        agree = np.array([not dead[g] and games[g].done and bool(env_done[g])
+                          and list(games[g].committed)
+                          == [int(c) * scale for c in np.asarray(s.committed)[g]]
+                          for g in range(len(h))])
+        self.record_pay.append((pay.copy(), real_pay / scale, scored.copy(), agree))
+      use = scored & ~broken
+      pay = np.where(use, real_pay / scale, pay)
     self.stats["games"] += len(h)
     self.stats["seconds_slumbot"] += t_slumbot
     self.stats["seconds_total"] += time.time() - t0
-    trunc = float((~np.asarray(s.done) & ~dead).mean())
+    trunc = float((~env_done & ~dead & ~scored).mean())
     if self.record is not None:
       self.record.append((list(leaf_paths), h, first))
     return pay.reshape(self.chunk, self.n_games).mean(1), trunc

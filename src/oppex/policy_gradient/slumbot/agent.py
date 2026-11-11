@@ -14,6 +14,9 @@ against Slumbot (``SlumbotRollouts``), as in the env match
     of the pseudo-harmonic translation.
   * The real string after every step goes to ``SlumbotModel.set_real``, so
     the model conditions on Slumbot's exact chips.
+  * Leaf rollouts and the subgame's folds and showdowns pay real chips
+    (``SlumbotRollouts(real_chips=True)``, ``real_terminal_payoffs``): the
+    game on slumbot.com is scored in them, not in the env's rounded chips.
 
 The translation type ``u`` is set by slumbot.com's hand number, which the
 server does not send, so it is marginalised per hand. **Possible extension,
@@ -26,10 +29,13 @@ untested.
 
 Each hand's record carries ``steps`` in ``play_vs_blueprint``'s format.
 Slumbot's steps hold the model's marginal at its revealed hand, the
-distribution AIVAT's opponent terms need.
+distribution AIVAT's opponent terms need. With ``solves_dir`` set, the played
+subgames are saved at the end of each hand for ``offline_aivat.py``.
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
@@ -39,6 +45,7 @@ from ..blueprint import PLURIBUS_FACTOR
 from ..resolving import ResolvingAgent, _view
 from . import native
 from .model import SlumbotModel, our_token, slumbot_atom
+from .offline_aivat import save_hand_solves
 from .play import RealGame, card_index, real_incr
 from .rollouts import SlumbotRollouts, _advance
 
@@ -56,14 +63,16 @@ class SlumbotResolvingAgent(ResolvingAgent):
     # zero_prob: Slumbot moves the model gave probability 0 at its hand.
     self.stats = {"hands": 0, "desync": 0, "string_mismatch": [], "slumbot_steps": 0,
                   "zero_prob": 0, "lost_hands": 0, "bet_gap": []}
+    self.solves_dir = None
 
   def _resolver_kw(self, kw: dict) -> dict:
     kw = dict(kw)
     self.model = SlumbotModel(self.env.rules)
     self.rollouts = SlumbotRollouts(self, self.model, n_games=kw.pop("leaf_games", 128),
                                     chunk=kw.pop("chunk_leaves", 32),
-                                    factor=kw.get("factor", PLURIBUS_FACTOR))
-    return {**kw, "model": self.model, "rollouts": self.rollouts}
+                                    factor=kw.get("factor", PLURIBUS_FACTOR), real_chips=True)
+    return {**kw, "model": self.model, "rollouts": self.rollouts,
+            "terminal_fn": self.model.real_terminal_payoffs}
 
   def new_state(self, hole, seat):
     s = super().new_state(hole, seat)
@@ -166,6 +175,9 @@ class SlumbotResolvingAgent(ResolvingAgent):
         st["probs"] = [float(x) for x in p]
         self.stats["slumbot_steps"] += 1
         self.stats["zero_prob"] += int(p[st["atom"]] <= 0)
+    if h is not None and self.solves_dir is not None and self.resolver.solves:
+      path = os.path.join(self.solves_dir, f"hand_{self.stats['hands'] - 1:05d}.npz")
+      save_hand_solves(path, self.resolver.solves, h, self.resolver.depth)
 
   def hand_info(self) -> dict:
     info = super().hand_info()

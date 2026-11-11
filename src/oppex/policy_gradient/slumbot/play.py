@@ -378,12 +378,17 @@ def main() -> None:
   ap.add_argument("--min-interval", type=float, default=1.0,
                   help="minimum seconds between API requests (do not go below 0.5)")
   ap.add_argument("--out", help="JSONL log (default: <run_dir>/<opponent>/<params>_<time>.jsonl)")
+  ap.add_argument("--save-solves", action="store_true",
+                  help="with --model slumbot: save the played subgames next to the log, for "
+                       "AIVAT after play (slumbot/offline_aivat.py)")
   args = ap.parse_args()
   if args.min_interval < 0.5:
     ap.error("--min-interval below 0.5 s would overload the Slumbot server")
 
   if args.model == "slumbot" and not args.resolve:
     ap.error("--model slumbot needs --resolve")
+  if args.save_solves and args.model != "slumbot":
+    ap.error("--save-solves needs --model slumbot")
   if args.resolve:
     from ...cfr import equity
     from ..resolving import ResolvingAgent
@@ -408,6 +413,10 @@ def main() -> None:
     f"{tag}{args.params}_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl",
   )
   os.makedirs(os.path.dirname(out), exist_ok=True)
+  if args.save_solves:
+    from .offline_aivat import solves_dir
+    agent.solves_dir = solves_dir(out)
+    os.makedirs(agent.solves_dir, exist_ok=True)
   if args.opponent == "random":
     # Imported here because random_opponent imports this module.
     from .random_opponent import RandomOpponent

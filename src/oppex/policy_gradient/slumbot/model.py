@@ -61,6 +61,7 @@ import sys
 
 from ...cfr.cards import HAND_CARDS, N_HANDS
 from ...cfr.subgame import expand_node
+from ...cfr.tree import FOLD_T, SHOWDOWN_T
 from ...envs import betting
 from ...envs.betting import ALL_IN, CALL, FOLD
 from . import native
@@ -273,6 +274,40 @@ class SlumbotModel:
           return r, []
         self._lose_real(history)
     return OpponentModel.belief(self, rules, history, our_cards, board, our_seat)
+
+  def real_terminal_payoffs(self, tree, payoff, sign, board, our_seat) -> np.ndarray:
+    """``(n_terminals, H)`` fold and showdown payoffs from Slumbot's exact chips.
+
+    For ``Resolver(terminal_fn=...)``, when the game is scored in real chips.
+    The tree's chips are rounded wherever Slumbot's bets are off our bins. A
+    terminal's line holds a set of worlds, each with exact chips, so hand
+    ``h`` is paid their mixture with weights ``|w| L_w(h)``, the weights its
+    reach is built from. ``payoff`` is the tree's table, kept for matrix leaves
+    and for hands or lines that no world explains (their reach is 0).
+    """
+    out = np.array(payoff, np.float64)
+    bkey = tuple(int(c) for c in board)
+    seat = int(our_seat)
+    for j, t in enumerate(tree.terminals):
+      if t.kind not in (FOLD_T, SHOWDOWN_T):
+        continue
+      path = tuple(int(a) for a in t.path)
+      ws = self._walk(path, bkey, seat)
+      if not ws:
+        continue
+      folder = int(self._step(path[:-1]).bs.cur_player) if t.kind == FOLD_T else None
+      num, den = np.zeros(N_HANDS), np.zeros(N_HANDS)
+      for w in ws:
+        weight = (1.0 if self.u is not None else _measure(w.ivs)) * w.lik
+        den += weight
+        if folder is None:
+          # At a showdown an uncalled excess goes back.
+          num += weight * sign * min(w.game.committed)
+        else:
+          num += weight * (-1 if folder == seat else 1) * w.game.committed[folder]
+      ok = den > 0
+      out[j, ok] = num[ok] / den[ok] / self.scale
+    return out
 
   # ── Walking a history ─────────────────────────────────────────────────────
 

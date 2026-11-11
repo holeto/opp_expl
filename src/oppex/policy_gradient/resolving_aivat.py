@@ -77,8 +77,7 @@ import time
 import numpy as np
 
 from ..cfr.cards import HAND_INDEX, N_HANDS
-from .blueprint import PLURIBUS_FACTOR
-from .resolving import LeafRollouts, Resolver, Solution, _fold
+from .resolving import Resolver, Solution, _fold
 from .slumbot.aivat import ExactEquity
 
 TERMS = ("deal", "board", "runout", "ours", "opponent")
@@ -158,12 +157,14 @@ class ResolvingAivat:
     # every call gets a seed of its own.
     self.n_rollouts = 0
     # Rollouts for boards valued by rollouts: one leaf at a time, more games
-    # than the solve's. Only the blueprint's rollouts take a board longer
-    # than the leaf's street, so other opponents keep the checkdown term.
+    # than the solve's. They must take a board longer than the leaf's street;
+    # rollouts that do not say so (no resized) keep the checkdown term.
     self.card_rollouts = None
-    if card_games and type(resolver.rollouts) is LeafRollouts:
-      factor = getattr(resolver.rollouts, "factor", PLURIBUS_FACTOR)
-      self.card_rollouts = LeafRollouts(resolver.bp, card_games, 1, factor)
+    if card_games:
+      try:
+        self.card_rollouts = resolver.rollouts.resized(card_games, 1)
+      except (AttributeError, NotImplementedError):
+        pass
 
   def new_hand(self, opp_cards) -> None:
     """Starts a hand against ``opp_cards``, which only the evaluator sees."""

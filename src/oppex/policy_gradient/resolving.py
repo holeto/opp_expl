@@ -300,6 +300,18 @@ class LeafRollouts:
 
     self._run = run
 
+  def resized(self, n_games: int, chunk: int) -> LeafRollouts:
+    """The same opponent's rollouts with ``n_games`` per leaf, ``chunk`` leaves per call.
+
+    For AIVAT's boards valued by rollouts, which also pass a board longer
+    than the leaf's street. A subclass opts in by overriding it; otherwise it
+    raises ``NotImplementedError``, since a copy of the base class would roll
+    out against the blueprint instead of the subclass's opponent.
+    """
+    if type(self) is not LeafRollouts:
+      raise NotImplementedError(f"{type(self).__name__} does not define resized")
+    return LeafRollouts(self.bp, n_games, chunk, self.factor)
+
   def _chunk(self, key, paths, q, ours, full, n_known, our_seat, t, leaf_paths, board):
     # One call: (mean chips to us per leaf of the chunk, truncated fraction).
     # leaf_paths and board (the visible board) are for subclasses.
@@ -512,7 +524,8 @@ class Resolver:
                iters: int = 500, factor: float = PLURIBUS_FACTOR,
                min_mass: float = 1e-4, chunk_leaves: int = 32, seed: int = 0,
                leaf_fn=None, model=None, rollouts=None, games_per_hand: int | None = None,
-               hand_chunk: int | None = None, leaf_cache_dir: str | None = None) -> None:
+               hand_chunk: int | None = None, leaf_cache_dir: str | None = None,
+               terminal_fn=None) -> None:
     self.bp, self.ev, self.depth, self.iters = bp, ev, depth, iters
     self.rules = bp.env.rules
     self.min_mass, self.seed = min_mass, seed
@@ -524,6 +537,9 @@ class Resolver:
                      else LeafRollouts(bp, leaf_games, chunk_leaves, factor))
     # leaf_fn(tree, r_term, our_cards, board, seat) overrides the rollouts.
     self.leaf_fn = leaf_fn
+    # terminal_fn(tree, payoff, sign, board, seat) replaces the fold and
+    # showdown payoffs, e.g. by the chips of the real game.
+    self.terminal_fn = terminal_fn
     # With games_per_hand, every (leaf, opponent hand) gets its own rollouts
     # and the solve keeps the per-history table (blueprint opponent only).
     self.hand_rollouts = None
@@ -573,7 +589,10 @@ class Resolver:
     z = belief.sum()
     if z <= 0:
       raise AssertionError(f"the opponent cannot have reached {history}")
-    payoff = terminal_payoffs(tree, self.seat, showdown_sign(self.cards, board, self.ev))
+    sign = showdown_sign(self.cards, board, self.ev)
+    payoff = terminal_payoffs(tree, self.seat, sign)
+    if self.terminal_fn is not None:
+      payoff = self.terminal_fn(tree, payoff, sign, board, self.seat)
     term = (payoff * r_term).sum(-1)
     t3 = time.time()
     trunc, table, n_cached = 0.0, None, 0
