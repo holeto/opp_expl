@@ -309,6 +309,31 @@ class SlumbotModel:
       out[j, ok] = num[ok] / den[ok] / self.scale
     return out
 
+  def real_checkdown_payoffs(self, tree, payoff, sign, board, our_seat) -> np.ndarray:
+    """``(n_leaves, H)`` checkdown payoffs of the leaves in Slumbot's exact chips.
+
+    For ``Resolver(leaf_mode="checkdown", leaf_payoff_fn=...)``. As in
+    ``real_terminal_payoffs``, hand ``h`` gets the mixture over the leaf's
+    worlds with weights ``|w| L_w(h)``. A pending bet is called, so each world
+    pays its larger commitment. ``payoff`` is the tree's table, kept for hands
+    no world explains (their reach is 0).
+    """
+    out = np.array(payoff, np.float64)
+    bkey = tuple(int(c) for c in board)
+    seat = int(our_seat)
+    for i, j in enumerate(tree.leaves):
+      ws = self._walk(tuple(int(a) for a in tree.terminals[j].path), bkey, seat)
+      if not ws:
+        continue
+      num, den = np.zeros(N_HANDS), np.zeros(N_HANDS)
+      for w in ws:
+        weight = (1.0 if self.u is not None else _measure(w.ivs)) * w.lik
+        den += weight
+        num += weight * sign * max(w.game.committed)
+      ok = den > 0
+      out[i, ok] = num[ok] / den[ok] / self.scale
+    return out
+
   # ── Walking a history ─────────────────────────────────────────────────────
 
   def _step(self, path: tuple) -> _Step:

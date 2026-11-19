@@ -60,7 +60,7 @@ from ..cfr.leaves import BucketedValues
 from ..cfr.subgame import build_subgame, replay_betting
 from ..cfr.tree import FOLD_T, MATRIX_T, SHOWDOWN_T
 from ..policy import policy_probs, sample_atom
-from .blueprint import N_TRANSFORMS, PLURIBUS_FACTOR, Blueprint, bias_multipliers
+from .blueprint import N_TRANSFORMS, PLURIBUS_FACTOR, Blueprint, bias_multipliers, sort_hole
 from .leaf_values import play_out
 from .slumbot.play import TreeAgent
 from .tree_policy import pad_paths, replay
@@ -222,6 +222,19 @@ def terminal_payoffs(tree, our_seat, sign) -> np.ndarray:
       if c[0] != c[1]:
         raise AssertionError(f"unequal commitments at showdown: {c}")
       out[j] = t.stake * sign
+  return out
+
+
+def checkdown_leaf_payoffs(tree, sign) -> np.ndarray:
+  """``(n_leaves, H)`` chips to us per opponent hand if both players check or
+  call from each leaf to a showdown.
+
+  A leaf at our decision may follow an opponent bet; it is called, so the
+  stake is the larger commitment.
+  """
+  out = np.zeros((len(tree.leaves), N_HANDS))
+  for i, j in enumerate(tree.leaves):
+    out[i] = sign * float(np.max(tree.terminals[j].betting.committed))
   return out
 
 
@@ -525,7 +538,16 @@ class Resolver:
                min_mass: float = 1e-4, chunk_leaves: int = 32, seed: int = 0,
                leaf_fn=None, model=None, rollouts=None, games_per_hand: int | None = None,
                hand_chunk: int | None = None, leaf_cache_dir: str | None = None,
-               terminal_fn=None) -> None:
+               terminal_fn=None, leaf_mode: str = "rollouts", leaf_payoff_fn=None) -> None:
+    """``leaf_mode="checkdown"`` values every leaf as if both players check or
+    call from it to a showdown (a pending bet is called), local best
+    response's assumption about the rest of the hand. It is exact and needs no
+    rollouts, and a leaf has one continuation. ``leaf_payoff_fn(tree, payoff,
+    sign, board, seat)`` replaces those payoffs, e.g. by the real game's chips.
+    """
+    if leaf_mode not in ("rollouts", "checkdown"):
+      raise ValueError(f"unknown leaf_mode {leaf_mode!r}")
+    self.leaf_mode, self.leaf_payoff_fn = leaf_mode, leaf_payoff_fn
     self.bp, self.ev, self.depth, self.iters = bp, ev, depth, iters
     self.rules = bp.env.rules
     self.min_mass, self.seed = min_mass, seed
@@ -568,6 +590,15 @@ class Resolver:
     self.solves: list[Solution] = []
     self.log: list[dict] = []
 
+  def solve_seed(self) -> int:
+    """The rollout seed of the next solve made in play.
+
+    Hashed from (seed, solve count). Their sum, used before, gave the run with
+    seed ``s + k`` the rollouts of run ``s`` shifted by ``k`` solves, so the
+    tasks of one job were not independent.
+    """
+    return int(np.random.SeedSequence([self.seed, self.n_solves]).generate_state(1)[0] >> 1)
+
   def solve(self, history, board, seed: int | None = None,
             depth: int | None | str = "default") -> Solution:
     """The subgame rooted after ``history``, solved for our seat.
@@ -596,14 +627,16 @@ class Resolver:
     term = (payoff * r_term).sum(-1)
     t3 = time.time()
     trunc, table, n_cached = 0.0, None, 0
-    if self.leaf_fn is not None:
+    if self.leaf_mode == "checkdown":
+      leaf = self.checkdown_leaves(tree, r_term, board, sign)
+    elif self.leaf_fn is not None:
       leaf = self.leaf_fn(tree, r_term, self.cards, board, self.seat)
     elif self.hand_rollouts is not None:
       leaf, trunc, table, n_cached = self._per_hand_leaves(tree, r_term, board, z)
     else:
       leaf, trunc = self.rollouts.values(
         tree, r_term, self.cards, board, self.seat,
-        seed=self.seed + self.n_solves if seed is None else seed,
+        seed=self.solve_seed() if seed is None else seed,
         min_mass=self.min_mass * z)
     t4 = time.time()
     game = infoset_cfr.InfosetGame(tree, self.seat, term, leaf)
@@ -625,6 +658,18 @@ class Resolver:
     index = {n.path: i for i, n in enumerate(tree.nodes)}
     return Solution(game, sigma, tau, float(z), node_of, stats, tuple(board), pi, payoff,
                     index, r_term[list(tree.leaves)].sum(-1), table)
+
+  def checkdown_leaves(self, tree, r_term, board, sign=None) -> np.ndarray:
+    """``(n_leaves, 1)`` checkdown values of the leaves, contracted against ``r_term``.
+
+    AIVAT calls it with ``r_term`` one-hot at the revealed hand.
+    """
+    if sign is None:
+      sign = showdown_sign(self.cards, board, self.ev)
+    pay = checkdown_leaf_payoffs(tree, sign)
+    if self.leaf_payoff_fn is not None:
+      pay = self.leaf_payoff_fn(tree, pay, sign, board, self.seat)
+    return (pay * r_term[list(tree.leaves)]).sum(-1)[:, None]
 
   def _per_hand_leaves(self, tree, r_term, board, z):
     # Leaf values from per-hand rollouts, reusing cached rows. The seed
@@ -714,12 +759,15 @@ class ResolvingAgent(TreeAgent):
 
 def play_vs_blueprint(bp: Blueprint, resolver: Resolver, n_hands: int, seed: int = 0,
                       log=None, progress: bool = True, aivat=None,
-                      opponent=None) -> list[dict]:
+                      opponent=None, duplicate: bool = False) -> list[dict]:
   """Hands against the blueprint in the env, each also played by the blueprint.
 
   Seats alternate. The control replays the same deal with the blueprint in our
   seat and the same uniform per env step, so ``payoff - control`` is a paired
-  difference. ``aivat`` (a ``resolving_aivat.ResolvingAivat``) records every
+  difference. With ``duplicate``, hands ``2k`` and ``2k + 1`` share the deal, the
+  uniforms and the opponent's hand type, so the second replays the first with
+  the seats and the hole cards swapped (``oppex.policy_gradient.duplicate``);
+  records then carry ``"pair": k``. ``aivat`` (a ``resolving_aivat.ResolvingAivat``) records every
   decision of the re-solved replay and adds its AIVAT terms under ``"aivat"``. ``opponent`` (e.g.
   ``slumbot.opponent.SlumbotOpponent``) replaces the blueprint in the other
   seat; it gets the same hand type in both replays of a hand. Returns one
@@ -731,14 +779,26 @@ def play_vs_blueprint(bp: Blueprint, resolver: Resolver, n_hands: int, seed: int
   apply = jax.jit(lambda s, a: env.apply_action(s, jnp.full((2,), a, jnp.int32)))
   records = []
   for i in range(n_hands):
-    key = jax.random.fold_in(jax.random.PRNGKey(seed), i)
+    # init_state deals seat 0 cards 0-1 and seat 1 cards 2-3, so the same key
+    # with the other seat is the swapped deal.
+    deal = i // 2 if duplicate else i
+    key = jax.random.fold_in(jax.random.PRNGKey(seed), deal)
     seat = i % 2
-    u = np.random.default_rng([seed, i]).random(env.max_length + 1)
-    u_type = float(np.random.default_rng([seed, i, 1]).random())
+    u = np.random.default_rng([seed, deal]).random(env.max_length + 1)
+    u_type = float(np.random.default_rng([seed, deal, 1]).random())
     rec = {"hand": i, "seat": seat}
+    if duplicate:
+      rec["pair"] = deal
     for mode in ("resolve", "control"):
       s = env.init_state(key)
+      if opponent is None:
+        # The blueprint opponent holds its cards in OpponentModel's order.
+        s = sort_hole(s, 1 - seat)
       hole = [int(c) for c in np.asarray(s.hole_cards)[seat]]
+      if duplicate and mode == "resolve":
+        # The deal, so the swap of a pair can be checked from the log.
+        rec["cards"] = {"ours": hole, "board": [int(c) for c in np.asarray(s.board)],
+                        "theirs": [int(c) for c in np.asarray(s.hole_cards)[1 - seat]]}
       resolver.new_hand(seat, hole)
       if opponent is not None:
         opponent.new_hand(seat, np.asarray(s.hole_cards)[1 - seat], np.asarray(s.board), u_type)
@@ -826,3 +886,10 @@ def report_play(recs, mbb) -> None:
   for st, name in enumerate(("preflop", "flop", "turn", "river")):
     n = sum(s["street"] == (0, 3, 4, 5)[st] for s in solves)
     print(f"  {name:>7}: {n} re-solves")
+  if recs and all("pair" in r for r in recs):
+    from .duplicate import report_duplicate
+    print("  duplicate pairs (mbb/hand, ±95%; std in BB/hand):")
+    report_duplicate(recs, "re-solving", value=lambda r: r["payoff"] * mbb)
+    report_duplicate(recs, "control", value=lambda r: r["control"] * mbb)
+    report_duplicate(recs, "paired difference",
+                     value=lambda r: (r["payoff"] - r["control"]) * mbb)

@@ -370,9 +370,15 @@ def main() -> None:
   ap.add_argument("--depth", type=int, default=4, help="re-solving depth in plies")
   ap.add_argument("--leaf-games", type=int, default=128, help="rollouts per leaf and t")
   ap.add_argument("--cfr-iters", type=int, default=500)
-  ap.add_argument("--opponent", choices=("slumbot", "random", "local"), default="slumbot",
+  ap.add_argument("--opponent", choices=("slumbot", "random", "local", "always_call"),
+                  default="slumbot",
                   help="random: a local uniformly random opponent (random_opponent.py); "
-                       "local: Slumbot from the C++ library (local.py, needs SLUMBOT_DIR)")
+                       "local: Slumbot from the C++ library (local.py, needs SLUMBOT_DIR); "
+                       "always_call: the always-call chump, for --lbr (lbr.py)")
+  ap.add_argument("--lbr", choices=("fc", "fcpa", "bins"),
+                  help="play local best response with these bets instead of the blueprint "
+                       "(lbr.py): fc none, fcpa the pot bin and all-in, bins every bin and "
+                       "all-in; with --call-streets 2 it acts on the turn and river only")
   ap.add_argument("--hands", type=int, default=10)
   ap.add_argument("--seed", type=int, default=0)
   ap.add_argument("--min-interval", type=float, default=1.0,
@@ -381,24 +387,64 @@ def main() -> None:
   ap.add_argument("--save-solves", action="store_true",
                   help="with --model slumbot: save the played subgames next to the log, for "
                        "AIVAT after play (slumbot/offline_aivat.py)")
+  ap.add_argument("--leaf-mode", choices=("rollouts", "checkdown"), default="rollouts",
+                  help="--resolve's leaf values: rollouts, or a checkdown from every leaf "
+                       "(local best response's assumption)")
+  ap.add_argument("--trace-refusals", action="store_true",
+                  help="with --model slumbot: log how every refused rollout game got there, "
+                       "in each hand's record (resolving.rollout_refusals)")
+  ap.add_argument("--call-streets", type=int, default=0,
+                  help="with --model slumbot or --lbr: check/call every decision on the first N "
+                       "streets and decide only from the next one (slumbot/agent.py, lbr.py)")
+  ap.add_argument("--duplicate", action="store_true",
+                  help="with --opponent local, random or always_call: hands 2k and 2k+1 replay "
+                       "one deal with the seats and cards swapped (policy_gradient/duplicate.py)")
   args = ap.parse_args()
+  if args.duplicate and args.opponent == "slumbot":
+    ap.error("--duplicate needs a local opponent: slumbot.com deals the cards")
   if args.min_interval < 0.5:
     ap.error("--min-interval below 0.5 s would overload the Slumbot server")
 
+  if args.lbr:
+    if args.resolve or args.exploiter:
+      ap.error("--lbr replaces --resolve and --exploiter")
+    if args.opponent == "random":
+      ap.error("--lbr has no model of the random opponent")
+    if args.save_solves or args.trace_refusals:
+      ap.error("--lbr solves nothing and rolls nothing out")
+  elif args.opponent == "always_call":
+    ap.error("--opponent always_call is only for --lbr")
   if args.model == "slumbot" and not args.resolve:
     ap.error("--model slumbot needs --resolve")
   if args.save_solves and args.model != "slumbot":
     ap.error("--save-solves needs --model slumbot")
-  if args.resolve:
+  if args.call_streets and args.model != "slumbot" and not args.lbr:
+    ap.error("--call-streets needs --model slumbot or --lbr")
+  if args.trace_refusals and args.model != "slumbot":
+    ap.error("--trace-refusals needs --model slumbot")
+  if args.lbr:
+    from ...cfr import equity
+    from . import lbr
+    ev = equity.preflop_ev_matrix(n_boards=200_000, progress=False)
+    if args.opponent == "always_call":
+      agent = lbr.LBRAgent(args.run_dir, args.checkpoint, args.params, ev, None, bets=args.lbr,
+                           call_streets=args.call_streets)
+      agent.model = lbr.AlwaysCallModel(agent.env.num_actions)
+    else:
+      agent = lbr.SlumbotLBRAgent(args.run_dir, args.checkpoint, args.params, ev,
+                                  bets=args.lbr, call_streets=args.call_streets,
+                                  seed=args.seed)
+  elif args.resolve:
     from ...cfr import equity
     from ..resolving import ResolvingAgent
     cls = ResolvingAgent
     if args.model == "slumbot":
       from .agent import SlumbotResolvingAgent as cls
+    extra = {"call_streets": args.call_streets} if args.model == "slumbot" else {}
     agent = cls(args.run_dir, args.checkpoint, args.params,
                 equity.preflop_ev_matrix(n_boards=200_000, progress=False),
                 depth=args.depth, leaf_games=args.leaf_games, iters=args.cfr_iters,
-                seed=args.seed)
+                seed=args.seed, leaf_mode=args.leaf_mode, **extra)
   elif args.exploiter:
     # Imported here because exploiter imports this module.
     from ..exploiter import ExploiterAgent
@@ -406,7 +452,8 @@ def main() -> None:
                            seed=args.seed + 2)
   else:
     agent = TreeAgent(args.run_dir, args.checkpoint, args.params)
-  tag = ("resolve_slumbot_" if args.model == "slumbot" else "resolve_" if args.resolve
+  tag = (f"lbr_{args.lbr}_c{args.call_streets}_" if args.lbr
+         else "resolve_slumbot_" if args.model == "slumbot" else "resolve_" if args.resolve
          else "exploiter_" if args.exploiter else "")
   out = args.out or os.path.join(
     args.run_dir, args.opponent,
@@ -417,13 +464,18 @@ def main() -> None:
     from .offline_aivat import solves_dir
     agent.solves_dir = solves_dir(out)
     os.makedirs(agent.solves_dir, exist_ok=True)
+  if args.trace_refusals:
+    agent.rollouts.refusal_log = []
   if args.opponent == "random":
     # Imported here because random_opponent imports this module.
     from .random_opponent import RandomOpponent
-    client = RandomOpponent(agent.bins, seed=args.seed + 1)
+    client = RandomOpponent(agent.bins, seed=args.seed + 1, duplicate=args.duplicate)
   elif args.opponent == "local":
     from .local import LocalSlumbot
-    client = LocalSlumbot(seed=args.seed + 1)
+    client = LocalSlumbot(seed=args.seed + 1, duplicate=args.duplicate)
+  elif args.opponent == "always_call":
+    from .lbr import AlwaysCallOpponent
+    client = AlwaysCallOpponent(seed=args.seed + 1, duplicate=args.duplicate)
   else:
     client = SlumbotClient(min_interval=args.min_interval)
     username = os.environ.get("SLUMBOT_USERNAME")
@@ -433,7 +485,7 @@ def main() -> None:
   rng = np.random.default_rng(args.seed)
   print(f"{agent.checkpoint} (step {agent.step}, {args.params}) → {out}", flush=True)
 
-  total, t0 = 0, time.monotonic()
+  total, t0, results = 0, time.monotonic(), []
   with open(out, "a") as f:
     for h in range(args.hands):
       try:
@@ -443,6 +495,12 @@ def main() -> None:
         break
       hand.update(hand=h, checkpoint=agent.checkpoint, step=agent.step, params=args.params,
                   opponent=args.opponent)
+      if args.duplicate:
+        hand["pair"] = h // 2
+      if args.opponent == "local":
+        # Hidden from the agent; kept for checks after play.
+        hand["u"] = client.u
+      results.append((h, hand["winnings"]))
       f.write(json.dumps(hand) + "\n")
       f.flush()
       total += hand["winnings"]
@@ -453,6 +511,10 @@ def main() -> None:
             f"{time.monotonic() - t0:.0f}s, {client.n_requests} requests)", flush=True)
   if hasattr(agent, "summary"):
     print(agent.summary(), flush=True)
+  if args.duplicate:
+    from ..duplicate import report_duplicate
+    print("duplicate pairs (mbb/hand, ±95%; std in BB/hand):")
+    report_duplicate([(h, 1000 * w / BIG_BLIND) for h, w in results], "winnings")
   if args.opponent == "local":
     print(f"local Slumbot: {client.stats['moves']} moves, {len(client.stats['refused'])} "
           f"refused {client.stats['refused'][:3]}", flush=True)

@@ -57,14 +57,17 @@ _KIND_TOKEN = {native.SB_FOLD: "f", native.SB_CHECK: "k", native.SB_CALL: "c"}
 
 
 def _point(ivs, frac: float) -> float:
-  # The point at fraction `frac` of the measure of the intervals `ivs`.
-  target, acc = frac * _measure(ivs), 0.0
+  # The point at fraction `frac` of the measure of the intervals `ivs`. In
+  # float64 and clamped into its interval: a float32 `frac` (a JAX uniform)
+  # made this arithmetic float32, whose rounding put the point just outside,
+  # in a cell where Slumbot's past actions are off its tree.
+  target, acc = float(frac) * _measure(ivs), 0.0
   for lo, hi in ivs:
     if acc + (hi - lo) > target:
-      return lo + (target - acc)
+      return min(max(lo + (target - acc), lo), float(np.nextafter(hi, lo)))
     acc += hi - lo
   lo, hi = ivs[-1]
-  return np.nextafter(hi, lo)
+  return float(np.nextafter(hi, lo))
 
 
 def _sample_first_axis(wts: np.ndarray, u: np.ndarray) -> np.ndarray:
@@ -166,6 +169,8 @@ class SlumbotRollouts(LeafRollouts):
     # When a list, each chunk appends (env pay, real pay, scored from real
     # chips, env and real chips agree at a shared end), for validation.
     self.record_pay = None
+    # When a list, every refusal appends how its game got there, for diagnosis.
+    self.refusal_log = None
     # refused: (string, status) of the first refusals, for diagnosis.
     # string_ended: games stopped because Slumbot's string ended while the env
     # hand went on; env_ended: env hands that ended before Slumbot's string.
@@ -224,6 +229,8 @@ class SlumbotRollouts(LeafRollouts):
     boards = np.asarray(s.board)
     opp_cards = HAND_CARDS[h]
     strings, games, u, dead = self._worlds(leaf_paths, board, seat, h, u_world, u_type)
+    # The world's string at the leaf, so a refusal can show what the rollout added.
+    leaf_strings = list(strings)
     payoff = np.zeros(len(h))
     # With real_chips: games whose real payoff is fixed, the payoffs, and games
     # whose tracker is unusable after an illegal token, which keep the env's.
@@ -263,6 +270,19 @@ class SlumbotRollouts(LeafRollouts):
             self.stats["refusals"] += 1
             if len(self.stats["refused"]) < 20:
               self.stats["refused"].append((strings[g], int(status[j])))
+            if self.refusal_log is not None:
+              step = int(np.asarray(s.step)[g])
+              self.refusal_log.append({
+                "status": native.STATUS_NAMES.get(int(status[j]), int(status[j])),
+                "string": strings[g], "leaf_string": leaf_strings[g],
+                "rollout_tokens": strings[g][len(leaf_strings[g]):],
+                "leaf_path": [int(a) for a in leaf_paths[g // self.n_games]],
+                "env_history": [int(a) for a in np.asarray(s.action_history)[g][:step]],
+                "env_committed": [float(c) for c in np.asarray(s.committed)[g]],
+                "real_committed": list(games[g].committed),
+                "board": [int(c) for c in boards[g]], "slumbot_cards": [int(c) for c in opp_cards[g]],
+                "our_cards": [int(c) for c in np.asarray(ours)], "our_seat": seat,
+                "u": float(u[g]), "continuation": int(t), "game": int(g % self.n_games)})
             atoms[g] = CALL
             tokens[g] = "c" if games[g].call_amount(opp_seat) > 0 else "k"
             continue

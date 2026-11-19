@@ -12,6 +12,8 @@ env:
   num_bet_bins: 4
   reward_type: difference
   drop_duplicate_allin: true
+  # Hole cards in ascending order in observations: one input per hand.
+  sort_hole_cards: true
 algorithm:
   type: qmmd
   batch_size: 8000

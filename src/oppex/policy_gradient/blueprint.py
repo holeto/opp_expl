@@ -65,6 +65,23 @@ def transform_policy(
   return biased / biased.sum(-1, keepdims=True)
 
 
+def sort_hole(s, seat):
+  """``s`` with ``seat``'s two hole cards in ascending order, ``HAND_CARDS``' order.
+
+  Checkpoints trained on cards in deal order (``qmmd_hunl_560k``, before the
+  env's ``sort_hole_cards``) are not invariant to the order of a player's two
+  cards: A♠K♦ and K♦A♠ get different policies. Every per-hand model of the
+  blueprint (``OpponentModel``, ``blueprint_tree_strategy``, the opponent
+  hands of the leaf rollouts) presents hands sorted. So where the blueprint is
+  the modelled opponent in an env match, its cards are sorted here, and the
+  model is exact; its overall frequencies barely change (``AGENTS.md``).
+  Works on one state or a batch, with ``seat`` a scalar or one per game.
+  """
+  hole = jnp.asarray(s.hole_cards)
+  pick = (jnp.arange(2) == jnp.asarray(seat)[..., None])[..., None]
+  return s._replace(hole_cards=jnp.where(pick, jnp.sort(hole, -1), hole))
+
+
 # ── Checkpoint ───────────────────────────────────────────────────────────────
 
 

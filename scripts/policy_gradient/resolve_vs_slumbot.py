@@ -21,6 +21,7 @@ import yaml
 from oppex.cfr import equity
 from oppex.policy_gradient.blueprint import Blueprint
 from oppex.policy_gradient.resolving import Resolver, play_vs_blueprint, report_play
+from oppex.policy_gradient.duplicate import report_aivat_duplicate
 from oppex.policy_gradient.resolving_aivat import ResolvingAivat, report_aivat
 from oppex.policy_gradient.slumbot.model import SlumbotModel
 from oppex.policy_gradient.slumbot.opponent import SlumbotOpponent
@@ -39,6 +40,8 @@ def main() -> None:
   ap.add_argument("--boards", type=int, default=200_000, help="preflop EV boards (cached)")
   ap.add_argument("--seed", type=int, default=0)
   ap.add_argument("--no-aivat", action="store_true")
+  ap.add_argument("--duplicate", action="store_true",
+                  help="hands 2k and 2k+1 replay one deal with the seats swapped")
   ap.add_argument("--no-cover-opponent", action="store_true",
                   help="skip AIVAT terms for Slumbot decisions outside every played subgame")
   ap.add_argument("--out", help="JSONL log (default: <run_dir>/resolving/vs_slumbot_...)")
@@ -53,6 +56,8 @@ def main() -> None:
     report_play(recs, mbb)
     if any("aivat" in r for r in recs):
       report_aivat(recs, mbb)
+      if all("pair" in r for r in recs):
+        report_aivat_duplicate(recs, mbb)
     return
 
   bp = Blueprint(args.run_dir, args.checkpoint, args.params)
@@ -65,16 +70,19 @@ def main() -> None:
   aivat = None if args.no_aivat else ResolvingAivat(res, cover_opponent=not args.no_cover_opponent)
   out = args.out or os.path.join(args.run_dir, "resolving",
                                  f"vs_slumbot_d{args.depth}_n{args.leaf_games}_"
-                                 f"it{args.cfr_iters}_s{args.seed}.jsonl")
+                                 f"it{args.cfr_iters}_s{args.seed}"
+                                 f"{'_dup' if args.duplicate else ''}.jsonl")
   os.makedirs(os.path.dirname(out), exist_ok=True)
   print(f"{args.hands} hands against Slumbot -> {out}", flush=True)
   with open(out, "w") as f:
     recs = play_vs_blueprint(bp, res, args.hands, seed=args.seed, log=f, aivat=aivat,
-                             opponent=opponent)
+                             opponent=opponent, duplicate=args.duplicate)
   mbb = 1e3 / bp.env.big_blind
   report_play(recs, mbb)
   if aivat is not None:
     report_aivat(recs, mbb)
+    if args.duplicate:
+      report_aivat_duplicate(recs, mbb)
   print(f"  Slumbot: {opponent.stats['moves']} moves, {len(opponent.stats['refused'])} refused, "
         f"{opponent.stats['desync']} desyncs; model refusals {len(model.stats['failures'])}, "
         f"desyncs {model.stats['desync']}; rollouts {rollouts.stats['refusals']} refusals "

@@ -42,6 +42,7 @@ from oppex.cfr.subgame import build_subgame
 from oppex.envs import betting
 from oppex.policy_gradient import leaf_values as lv
 from oppex.policy_gradient.blueprint import N_TRANSFORMS, Blueprint
+from oppex.policy_gradient.duplicate import report_aivat_duplicate
 from oppex.policy_gradient.resolving_aivat import ResolvingAivat, report_aivat
 from oppex.policy_gradient.resolving import (
   Resolver, bucketed_leaf_values, play_vs_blueprint, report_play,
@@ -58,7 +59,8 @@ def load_cache(run_dir, bp, games, buckets, seed=0, factor=5.0):
     mmd = pickle.load(f)
   vb = {}
   for fixed in (0, 1):
-    name = f"leaves_fixed{fixed}_{tag}_n{games}_f{factor:g}_k{buckets}_s{seed}.pkl"
+    name = (f"leaves_fixed{fixed}_{tag}_n{games}_f{factor:g}_k{buckets}_s{seed}"
+            f"_{lv.CARD_ORDER}.pkl")
     with open(os.path.join(d, name), "rb") as f:
       vb[1 - fixed] = np.asarray(pickle.load(f)[0])
   return tr, mmd, vb
@@ -196,13 +198,15 @@ def main():
   ap.add_argument("--cfr-iters", type=int, default=500)
   ap.add_argument("--seed", type=int, default=0)
   ap.add_argument("--no-aivat", action="store_true")
+  ap.add_argument("--duplicate", action="store_true",
+                  help="--play: hands 2k and 2k+1 replay one deal with the seats swapped")
   ap.add_argument("--no-cover-opponent", action="store_true",
                   help="skip AIVAT terms for opponent decisions outside every played subgame "
                        "instead of solving them when reached")
   args = ap.parse_args()
   if args.leaf_file is None:
     args.leaf_file = os.path.join(args.run_dir, "leaf_values",
-                                  "leaf_1-1_params_step560000_n10000_f5_k10_s0.npz")
+                                  "leaf_1-1_params_step560000_n10000_f5_k10_s0_sorted.npz")
 
   bp = Blueprint(args.run_dir, args.checkpoint, args.params)
   ev = equity.preflop_ev_matrix(n_boards=args.boards, progress=False)
@@ -223,7 +227,8 @@ def main():
     out_dir = os.path.join(args.run_dir, "resolving")
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"vs_blueprint_d{args.depth}_n{args.leaf_games}_"
-                                f"it{args.cfr_iters}_s{args.seed}.jsonl")
+                                f"it{args.cfr_iters}_s{args.seed}"
+                                f"{'_dup' if args.duplicate else ''}.jsonl")
     res = Resolver(bp, ev, depth=args.depth, leaf_games=args.leaf_games,
                    iters=args.cfr_iters, seed=args.seed)
     aivat = None
@@ -231,11 +236,14 @@ def main():
       aivat = ResolvingAivat(res, cover_opponent=not args.no_cover_opponent)
     print(f"\nf. {args.play} hands against the blueprint -> {out}")
     with open(out, "w") as f:
-      recs = play_vs_blueprint(bp, res, args.play, seed=args.seed, log=f, aivat=aivat)
+      recs = play_vs_blueprint(bp, res, args.play, seed=args.seed, log=f, aivat=aivat,
+                               duplicate=args.duplicate)
     mbb = 1e3 / bp.env.big_blind
     report_play(recs, mbb)
     if aivat is not None:
       report_aivat(recs, mbb)
+      if args.duplicate:
+        report_aivat_duplicate(recs, mbb)
 
 
 if __name__ == "__main__":

@@ -133,9 +133,10 @@ def evaluate_hand(agent, aivat: ResolvingAivat, rec: dict, solves: list[Solution
     actor, atom = int(step["actor"]), int(step["atom"])
     probs = np.asarray(step["probs"], np.float64)
     if actor == seat:
-      # The solve this decision was played from, as resolver.probs left it.
-      res.solution = solves[step["solve"]]
-      if not res.solves or res.solves[-1] is not res.solution:
+      # The solve this decision was played from, as resolver.probs left it;
+      # None for a decision fixed to check/call (call_streets).
+      res.solution = None if step["solve"] is None else solves[step["solve"]]
+      if res.solution is not None and (not res.solves or res.solves[-1] is not res.solution):
         res.solves.append(res.solution)
     else:
       # Must match the logged marginal: same model, same strings so far.
@@ -163,13 +164,23 @@ def evaluate_hand(agent, aivat: ResolvingAivat, rec: dict, solves: list[Solution
 
 
 def _report(args) -> None:
-  recs = [json.loads(line) for path in args.report for line in open(path)]
+  recs = []
+  for k, path in enumerate(args.report):
+    for line in open(path):
+      rec = json.loads(line)
+      # Every log numbers its hands from 0 and a pair never spans two logs,
+      # so the hands get distinct keys for the pairing.
+      rec["pair_key"] = k * 1_000_000 + rec["hand"]
+      recs.append(rec)
   with open(os.path.join(args.run_dir, "config.yaml")) as f:
     mbb = 1e3 / float(yaml.safe_load(f)["env"]["big_blind"])
   print(f"{len(recs)} hands from {len(args.report)} logs")
   report_aivat(recs, mbb)
   print(f"  largest gap between recomputed and logged Slumbot probabilities: "
         f"{max(r['prob_gap'] for r in recs):.2e}")
+  if args.duplicate:
+    from ..duplicate import report_aivat_duplicate
+    report_aivat_duplicate([{**r, "hand": r["pair_key"]} for r in recs], mbb)
 
 
 def main() -> None:
@@ -181,11 +192,15 @@ def main() -> None:
   ap.add_argument("--depth", type=int, default=4, help="as in play")
   ap.add_argument("--leaf-games", type=int, default=128)
   ap.add_argument("--cfr-iters", type=int, default=500)
+  ap.add_argument("--leaf-mode", choices=("rollouts", "checkdown"), default="rollouts",
+                  help="as in play; the evaluation-only solves and leaf values use it")
   ap.add_argument("--seed", type=int, default=0)
   ap.add_argument("--task", type=int, default=0, help="this task handles hand % tasks == task")
   ap.add_argument("--tasks", type=int, default=1)
   ap.add_argument("--out", help="JSONL of the hands' AIVAT terms")
   ap.add_argument("--report", nargs="+", metavar="LOG", help="only pool and report these")
+  ap.add_argument("--duplicate", action="store_true",
+                  help="with --report: also the duplicate estimates (hands 2k, 2k+1 of a log)")
   args = ap.parse_args()
   if args.report:
     _report(args)
@@ -198,7 +213,8 @@ def main() -> None:
   agent = SlumbotResolvingAgent(args.run_dir, args.checkpoint, args.params,
                                 equity.preflop_ev_matrix(n_boards=200_000, progress=False),
                                 depth=args.depth, leaf_games=args.leaf_games,
-                                iters=args.cfr_iters, seed=args.seed)
+                                iters=args.cfr_iters, seed=args.seed,
+                                leaf_mode=args.leaf_mode)
   aivat = ResolvingAivat(agent.resolver)
   rules = agent.env.rules
   done, skipped = 0, 0

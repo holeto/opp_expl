@@ -6,7 +6,8 @@ the network: a dress rehearsal for the real server. Each hand draws a hidden
 translation type ``u``, as a slumbot.com hand number would set it, and every
 Slumbot move comes from ``sb_act_batch`` on the exact string, i.e. the live
 agent's move. Deal, seats and payoffs are ``RandomOpponent``'s. Needs
-``SLUMBOT_DIR``.
+``SLUMBOT_DIR``. Like the deck, ``u`` is drawn per deal, so the two hands of a
+duplicate pair face the same Slumbot.
 """
 
 from __future__ import annotations
@@ -22,14 +23,15 @@ _KIND_TOKEN = {native.SB_FOLD: "f", native.SB_CHECK: "k", native.SB_CALL: "c"}
 
 
 class LocalSlumbot(RandomOpponent):
-  def __init__(self, seed: int = 0) -> None:
-    super().__init__(np.zeros(0), seed)
+  def __init__(self, seed: int = 0, duplicate: bool = False) -> None:
+    super().__init__(np.zeros(0), seed, duplicate)
     self.lib = native.get()
     # us: the hidden translation type of each hand, for checks after play.
     self.stats = {"moves": 0, "refused": [], "us": []}
 
   def new_hand(self) -> dict[str, Any]:
-    self.u = float(self.rng.random())
+    # Set before the deal: Slumbot may move first.
+    self.u = float(self.deal_rng(1).random())
     self.stats["us"].append(self.u)
     return super().new_hand()
 

@@ -44,9 +44,19 @@ def sample_atom(probs: jax.Array, u: jax.Array) -> jax.Array:
   ``u`` is exactly 0, which a float32 uniform is with probability 2^-23. If
   rounding puts ``u · total`` at the total, the draw falls back to the last
   atom of positive weight rather than the last atom.
+
+  XLA's float32 ``cumsum`` is not monotone: over an atom of weight 0 it can
+  step up by an ulp, and a ``u · total`` inside that step drew the atom (a
+  rollout dealt Slumbot a hand blocked by the board). So an atom of weight 0
+  takes the cumulative weight of the last positive atom before it, and never
+  exceeds ``u · total`` first. Draws not hitting such a step are unchanged.
   """
   cdf = jnp.cumsum(probs, -1)
-  atom = (cdf <= u[..., None] * cdf[..., -1:]).sum(-1)
+  total = cdf[..., -1:]
   n = probs.shape[-1]
+  axis = probs.ndim - 1
+  prev = jax.lax.cummax(jnp.where(probs > 0, jnp.arange(n), -1), axis=axis)
+  cdf = jnp.where(prev >= 0, jnp.take_along_axis(cdf, jnp.maximum(prev, 0), axis), -jnp.inf)
+  atom = (cdf <= u[..., None] * total).sum(-1)
   last = n - 1 - jnp.argmax(jnp.flip(probs, -1) > 0, -1)
   return jnp.minimum(atom, last)

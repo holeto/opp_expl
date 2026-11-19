@@ -55,6 +55,11 @@ from .blueprint import (
 from .tree_policy import pad_paths, replay, where_b
 
 
+# Leaf rollouts deal each seat its cards in ascending order; cache names carry
+# this tag, so values sampled in deal order (before 2026-11-19) are not reused.
+CARD_ORDER = "sorted"
+
+
 class LeafSamples(NamedTuple):
   """Raw games of one leaf, every array shaped ``(T0, T1, n_games)``.
 
@@ -120,6 +125,10 @@ def _build_rollout(bp: Blueprint, n_games: int, factor: float):
   def rollout(key, paths, t0, t1):
     deal_key, act_key = jax.random.split(key)
     s = jax.vmap(env.init_state)(jax.random.split(deal_key, n_games))
+    # Both seats hold their cards in HAND_CARDS order (CARD_ORDER): the
+    # network is not card-order invariant, and the per-hand models of the
+    # blueprint and the exploiter's matches present hands sorted.
+    s = s._replace(hole_cards=jnp.sort(s.hole_cards, -1))
     # Replay the public preflop line that leads to the leaf.
     s = replay(env, s, paths)
     s, payoff = play_out(bp, s, jax.random.split(act_key, n_games), t0, t1, mult)
@@ -257,7 +266,7 @@ def cache_path(
 ) -> str:
   line = "-".join(str(int(a)) for a in path)
   name = (f"leaf_{line}_{bp.which}_step{bp.step}_n{n_games}_f{factor:g}"
-          f"_k{k}_s{seed}.npz")
+          f"_k{k}_s{seed}_{CARD_ORDER}.npz")
   return os.path.join(run_dir, "leaf_values", name)
 
 

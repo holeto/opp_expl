@@ -2,7 +2,7 @@
 
   uv run python scripts/policy_gradient/sample_leaf_values.py checkpoints/qmmd_hunl_560k
   uv run python scripts/solve_matrix_leaves.py \\
-      --leaf checkpoints/qmmd_hunl_560k/leaf_values/leaf_1-1_params_step560000_n10000_f5_k10_s0.npz \\
+      --leaf checkpoints/qmmd_hunl_560k/leaf_values/leaf_1-1_params_step560000_n10000_f5_k10_s0_sorted.npz \\
       --iters 2000 --dcfr --alternating
 
 The game is the ``--limp`` sanity-check tree of ``solve_pushfold.py``: SB folds,

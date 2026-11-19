@@ -217,6 +217,15 @@ class ResolvingAivat:
     self._leaf = None
     if actor == seat:
       sol = self.res.solution
+      if sol is None:
+        # A pure decision outside every subgame (SlumbotResolvingAgent's
+        # call_streets): its term is 0 whatever Q is, so none is computed.
+        if probs[atom] != 1.0:
+          raise AssertionError(f"our decision after {hist} has no solve but is not pure")
+        self._add({"kind": "ours", "history": list(hist), "pure": True,
+                   "action": int(atom)}, 0.0)
+        self.seconds += time.time() - t0
+        return
     else:
       self.info["opponent_steps"] += 1
       sol = self._covering(hist, board)
@@ -260,8 +269,9 @@ class ResolvingAivat:
 
   def _board_q(self, board, checkdown: float) -> None:
     # The rollout-valued term of the board just dealt, at the leaf the last
-    # decision entered; without one, the checkdown term stands in.
-    if self._leaf is None or self.card_rollouts is None:
+    # decision entered; without one, the checkdown term stands in. So it does
+    # with checkdown leaves: the rollouts' continuations are not the solve's.
+    if self._leaf is None or self.card_rollouts is None or self.res.leaf_mode == "checkdown":
       self.info["board_q_fallback"] += 1
       self.alt["board_q"] += checkdown
       self.nodes.append({"kind": "board_q", "fallback": True, "term": checkdown})
@@ -327,7 +337,14 @@ class ResolvingAivat:
     cache = self._leaf_v[id(sol)]
     weight = leaf_weights(sol, seat, h, [i])
     need = [int(l) for l in np.flatnonzero(weight >= self.min_weight) if int(l) not in cache]
-    if need:
+    if need and res.leaf_mode == "checkdown":
+      # Checkdown leaves are exact at h*: no rollouts, one continuation.
+      r = np.zeros((len(tree.terminals), N_HANDS))
+      r[[tree.leaves[l] for l in need], h] = 1.0
+      V = res.checkdown_leaves(tree, r, list(sol.board))
+      for l in need:
+        cache[l] = float(V[l] @ sol.tau[l])
+    elif need:
       r = np.zeros((len(tree.terminals), N_HANDS))
       r[[tree.leaves[l] for l in need], h] = 1.0
       # Continuations the leaf barely plays are dropped, the rest renormalised.

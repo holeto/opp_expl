@@ -179,6 +179,16 @@ class HunlHoldem(Env):
     max_length: optional override of the derived episode-length bound (see the
         ``max_length`` property). Set it from a measured length distribution of
         the policies actually being trained.
+    sort_hole_cards: encode each player's two hole cards in ascending card
+        index in every observation, instead of in deal order. A♠K♦ and K♦A♠
+        are one hand, but in deal order they are two inputs, and a trained
+        network is not invariant to the swap (the 560k QMMD blueprint differs
+        by a mean total variation of 0.14 at the SB's first decision). Sorting
+        makes the encoding order-invariant by construction; the state, deal,
+        showdown and rewards are unchanged. Default ``False``: existing
+        checkpoints were trained on deal order and their ``config.yaml`` has
+        no such key, so they keep playing exactly as trained. New training
+        runs opt in from the config.
   """
 
   def __init__(
@@ -191,6 +201,7 @@ class HunlHoldem(Env):
     reward_type: str = "difference",
     max_length: int | None = None,
     drop_duplicate_allin: bool = False,
+    sort_hole_cards: bool = False,
   ) -> None:
     if reward_type not in ("difference", "binary"):
       raise ValueError(f"reward_type must be 'difference' or 'binary', got '{reward_type}'")
@@ -204,6 +215,7 @@ class HunlHoldem(Env):
     self.reward_type = reward_type
     self._max_length = int(max_length) if max_length is not None else None
     self._drop_duplicate_allin = bool(drop_duplicate_allin)
+    self.sort_hole_cards = bool(sort_hole_cards)
     self.rules = betting.make_rules(
       starting_stack=self.starting_stack,
       small_blind=self.small_blind,
@@ -384,6 +396,14 @@ class HunlHoldem(Env):
     oh = jax.nn.one_hot(jnp.clip(cards, 0, 51), 52, dtype=jnp.float32)
     return (oh * (cards >= 0)[:, None]).reshape(-1)
 
+  def _hole_cards(self, state: HunlState) -> jax.Array:
+    # The (2, 2) hole cards as observations encode them: per player in
+    # ascending card index with `sort_hole_cards`, else in deal order. The
+    # flag is a Python bool, so the branch is static under jit.
+    if self.sort_hole_cards:
+      return jnp.sort(state.hole_cards, axis=-1)
+    return state.hole_cards
+
   def _visible_board(self, state: HunlState) -> jax.Array:
     n = jnp.asarray(self._STREET_BOARD)[state.street]
     return jnp.where(jnp.arange(5) < n, state.board, -1)
@@ -413,7 +433,7 @@ class HunlHoldem(Env):
     hole cards, so a value net cannot tell which side of the pot it is valuing
     (button vs. big blind have very different values at the same node).
     """
-    own = self._cards_one_hot(state.hole_cards[player_id])
+    own = self._cards_one_hot(self._hole_cards(state)[player_id])
     seat = jax.nn.one_hot(player_id, 2, dtype=jnp.float32)
     return jnp.concatenate(
       [own, self._cards_one_hot(self._visible_board(state)),
@@ -428,9 +448,10 @@ class HunlHoldem(Env):
 
   def state_observation(self, state: HunlState, key: PRNGKey) -> jax.Array:
     """Both players' hole cards (208) + full board (260) + betting features (15)."""
+    hole = self._hole_cards(state)
     return jnp.concatenate([
-      self._cards_one_hot(state.hole_cards[0]),
-      self._cards_one_hot(state.hole_cards[1]),
+      self._cards_one_hot(hole[0]),
+      self._cards_one_hot(hole[1]),
       self._cards_one_hot(state.board),
       self._betting_features(state),
     ])

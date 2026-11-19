@@ -50,6 +50,7 @@ from oppex.policy_gradient.resolving import (
   compatible,
   showdown_sign,
   subgame_reach,
+  checkdown_leaf_payoffs,
   terminal_payoffs,
 )
 from oppex.policy_gradient.slumbot.model import SlumbotModel
@@ -345,6 +346,55 @@ def run_terminals(args, bp):
   return 0 if max_exact < 1e-6 else 1
 
 
+# ── checkdown ────────────────────────────────────────────────────────────────
+
+
+def run_checkdown(args, bp):
+  # Checkdown leaves in real chips (model.real_checkdown_payoffs) against the
+  # tree's: equal wherever every world of a leaf holds the tree's chips x 50.
+  rules = bp.env.rules
+  rng = np.random.default_rng(args.seed)
+  ev = equity.preflop_ev_matrix(n_boards=args.boards, progress=False)
+  model = SlumbotModel(rules)
+  n_exact, n_diff, n_empty, max_exact = 0, 0, 0, 0.0
+  errs = []
+  for path, board, seat, ours in _roots(rng, rules, args.roots, 0.3):
+    tree = build_subgame(rules, model._step(path).bs, path, args.depth)
+    belief, _ = model.belief(rules, path, ours, board, seat)
+    if belief.sum() <= 0:
+      continue
+    _, r_term, _ = subgame_reach(tree, belief, model, ours, board, seat)
+    sign = showdown_sign(ours, board, ev)
+    payoff = checkdown_leaf_payoffs(tree, sign)
+    real = model.real_checkdown_payoffs(tree, payoff, sign, board, seat)
+    bkey = tuple(int(c) for c in board)
+    for i, j in enumerate(tree.leaves):
+      seen = r_term[j] > 0
+      if not seen.any():
+        continue
+      t = tree.terminals[j]
+      ws = model._walk(tuple(int(a) for a in t.path), bkey, seat)
+      if not ws:
+        n_empty += 1
+        continue
+      chips = [int(round(float(c))) * model.scale for c in np.asarray(t.betting.committed)]
+      d = np.abs(real[i, seen] - payoff[i, seen])
+      if all(list(w.game.committed) == chips for w in ws):
+        n_exact += 1
+        max_exact = max(max_exact, float(d.max()))
+      else:
+        n_diff += 1
+        errs.append(float((r_term[j, seen] * d).sum() / r_term[j, seen].sum()))
+  print(f"leaves reached: {n_exact} with every world on the tree's chips, {n_diff} with other "
+        f"chips, {n_empty} with no world")
+  print(f"on the tree's chips: max |real - tree| {max_exact:.2e} chips")
+  if errs:
+    print(f"on other chips: reach-mean |real - tree| per leaf {np.mean(errs):.2f} chips, "
+          f"max {np.max(errs):.2f}")
+  print(f"model: desync {model.stats['desync']}, refusals {len(model.stats['failures'])}")
+  return 0 if max_exact < 1e-6 else 1
+
+
 # ── hands ────────────────────────────────────────────────────────────────────
 
 
@@ -381,7 +431,7 @@ def run_hands(args, bp):
 
 def main() -> None:
   ap = argparse.ArgumentParser()
-  ap.add_argument("mode", choices=("posterior", "solve", "cards", "chips", "terminals", "hands"))
+  ap.add_argument("mode", choices=("posterior", "solve", "cards", "chips", "terminals", "checkdown", "hands"))
   ap.add_argument("run_dir")
   ap.add_argument("--checkpoint")
   ap.add_argument("--roots", type=int, default=20)
@@ -397,7 +447,7 @@ def main() -> None:
   ap.add_argument("--flops", type=int, default=45, help="cards: flops sampled per preflop leaf")
   args = ap.parse_args()
   bp = Blueprint(args.run_dir, args.checkpoint)
-  raise SystemExit({"posterior": run_posterior, "solve": run_solve, "cards": run_cards, "chips": run_chips, "terminals": run_terminals, "hands": run_hands}[args.mode](args, bp))
+  raise SystemExit({"posterior": run_posterior, "solve": run_solve, "cards": run_cards, "chips": run_chips, "terminals": run_terminals, "checkdown": run_checkdown, "hands": run_hands}[args.mode](args, bp))
 
 
 if __name__ == "__main__":

@@ -181,7 +181,7 @@ def main():
   for x in args.seats:
     fixed = 1 - x
     name = (f"leaves_fixed{fixed}_{tag}_n{args.games}_f{args.factor:g}"
-            f"_k{args.buckets}_s{args.seed}.pkl")
+            f"_k{args.buckets}_s{args.seed}_{lv.CARD_ORDER}.pkl")
 
     def build(fixed=fixed):
       samples = lv.sample_leaves(bp, paths, args.games, args.factor, args.seed,

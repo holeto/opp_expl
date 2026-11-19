@@ -56,14 +56,23 @@ _KIND = {"fold": native.SB_FOLD, "check": native.SB_CHECK, "call": native.SB_CAL
 class SlumbotResolvingAgent(ResolvingAgent):
   """``ResolvingAgent`` against Slumbot itself, for ``play.play_hand``."""
 
-  def __init__(self, run_dir, checkpoint, which, ev, **resolver_kw) -> None:
+  def __init__(self, run_dir, checkpoint, which, ev, call_streets: int = 0,
+               **resolver_kw) -> None:
+    """``call_streets``: on the first that many streets we check or call every
+    decision and solve nothing; re-solving starts on the next street. A test of
+    the later streets' solves: they start from a belief built by the exact model
+    after a line on which we never bet, so Slumbot never has to translate.
+    """
     super().__init__(run_dir, checkpoint, which, ev, **resolver_kw)
+    self.call_streets = int(call_streets)
     # desync: a real token illegal in our chip tracker. string_mismatch:
     # responses whose action string differs from ours (first few kept).
     # zero_prob: Slumbot moves the model gave probability 0 at its hand.
+    # called: our decisions fixed to check/call by call_streets.
     self.stats = {"hands": 0, "desync": 0, "string_mismatch": [], "slumbot_steps": 0,
-                  "zero_prob": 0, "lost_hands": 0, "bet_gap": []}
+                  "zero_prob": 0, "lost_hands": 0, "bet_gap": [], "called": 0}
     self.solves_dir = None
+    self._called = False
 
   def _resolver_kw(self, kw: dict) -> dict:
     kw = dict(kw)
@@ -72,7 +81,8 @@ class SlumbotResolvingAgent(ResolvingAgent):
                                     chunk=kw.pop("chunk_leaves", 32),
                                     factor=kw.get("factor", PLURIBUS_FACTOR), real_chips=True)
     return {**kw, "model": self.model, "rollouts": self.rollouts,
-            "terminal_fn": self.model.real_terminal_payoffs}
+            "terminal_fn": self.model.real_terminal_payoffs,
+            "leaf_payoff_fn": self.model.real_checkdown_payoffs}
 
   def new_state(self, hole, seat):
     s = super().new_state(hole, seat)
@@ -86,10 +96,22 @@ class SlumbotResolvingAgent(ResolvingAgent):
     self._probs = None
     self.model.new_hand()
     self.stats["hands"] += 1
+    # Where this hand's entries of the rollouts' refusal log begin, if it is on.
+    log = self.rollouts.refusal_log
+    self._refusal_mark = len(log) if log is not None else 0
     return s
 
   def policy(self, s, seat):
-    probs, legal = super().policy(s, seat)
+    self._called = int(s.street) < self.call_streets
+    if self._called:
+      legal = self.legal(s, seat)
+      if not legal[CALL]:
+        raise AssertionError("check/call is illegal for the player to act")
+      probs = np.zeros(len(legal))
+      probs[CALL] = 1.0
+      self.stats["called"] += 1
+    else:
+      probs, legal = super().policy(s, seat)
     self._probs = [float(p) for p in probs]
     return probs, legal
 
@@ -126,8 +148,8 @@ class SlumbotResolvingAgent(ResolvingAgent):
     self.steps.append({"actor": int(seat), "history": history, "street": int(tree.street),
                        "board": board,
                        "committed": np.asarray(tree.committed, np.float64).tolist(),
-                       "solve": len(self.resolver.solves) - 1, "atom": int(atom),
-                       "probs": self._probs})
+                       "solve": None if self._called else len(self.resolver.solves) - 1,
+                       "atom": int(atom), "probs": self._probs})
     return tok, atom
 
   def observe_token(self, token, tree, tree_lost) -> None:
@@ -182,6 +204,8 @@ class SlumbotResolvingAgent(ResolvingAgent):
   def hand_info(self) -> dict:
     info = super().hand_info()
     info["resolving"].update(steps=self.steps, real_action=self.actions, lost=self.lost)
+    if self.rollouts.refusal_log is not None:
+      info["resolving"]["rollout_refusals"] = self.rollouts.refusal_log[self._refusal_mark:]
     return info
 
   def summary(self) -> str:
@@ -192,5 +216,6 @@ class SlumbotResolvingAgent(ResolvingAgent):
             f"{len(s['string_mismatch'])} string mismatches {s['string_mismatch'][:3]}; "
             f"Slumbot steps {s['slumbot_steps']}, zero-probability {s['zero_prob']}; "
             f"bets exact {np.mean(gap == 0):.0%} (max gap {gap.max():.2f} pot); "
+            f"called without solving {s['called']}; "
             f"model refusals {len(m['failures'])}, desyncs {m['desync']}, real string lost "
             f"{m['real_lost']}; rollouts {ro['refusals']} refusals, {ro['desync']} desyncs")

@@ -120,6 +120,30 @@ Heads-up no-limit Texas Hold'em, 2 players, zero-sum.
   also fixes the history-buffer size, so changing it changes observation dimensionality.
 - **Rewards** are zero-sum and already normalised to `[-1, 1]` (hence `max_reward = 1.0`):
   `'difference'` divides net chips by the starting stack, `'binary'` is ±1/0.
+- **Hole-card order.** `init_state` deals each player's two cards in random order, and the
+  observations encode them one card per slot. So A♠K♦ and K♦A♠ are two inputs for one hand,
+  and a network trained on them need not treat them alike. `sort_hole_cards=True` encodes
+  each pair in ascending card index, which makes observations order-invariant by
+  construction. The state, deal, showdown and rewards are unchanged. The default is `False`
+  so that old checkpoints, whose `config.yaml` lacks the key, keep playing as trained;
+  `configs/qmmd_hunl.yaml` sets it for new runs.
+- **The QMMD checkpoint `checkpoints/qmmd_hunl_560k` was trained before that fix and is not
+  card-order invariant.** Swapping a hand's two cards changes its policy: at the SB's first
+  decision the mean total variation is 0.14 (max 0.36), and the most likely action differs
+  for 39% of hands. Range-level frequencies barely move (SB fold 23.2% vs 25.2%). Do not
+  load it into an env with `sort_hole_cards=True`: it would see inputs unlike its training
+  data. Every per-hand model of the blueprint (`OpponentModel`, `blueprint_tree_strategy`,
+  the leaf rollouts' opponent deals) presents hands in `HAND_CARDS` order, i.e. sorted.
+  Where the blueprint plays the opponent in an env match (`resolving.play_vs_blueprint`,
+  `validate_lbr.py`), its cards are sorted with `blueprint.sort_hole`, so the model is
+  exact. The matrix-leaf rollouts of `leaf_values` sort both seats. So do the exploiter's
+  env match and `ExploiterAgent`, whose play after a leaf is the biased blueprint the leaf
+  values assume. Leaf caches carry `leaf_values.CARD_ORDER` (`_sorted`) in their names,
+  so values sampled in deal order are never reused; they must be resampled. Blueprint-
+  opponent results from before 2026-11-19 played it in deal order, against a model wrong
+  for about half the deals.
+  Slumbot experiments are unaffected: Slumbot is order-invariant, and its model never uses
+  the network.
 
 ### Betting rules ([betting.py](src/oppex/envs/betting.py))
 

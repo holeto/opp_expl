@@ -11,6 +11,13 @@ bin as a pot fraction, and all-in (not when calling already covers the stack,
 as with ``drop_duplicate_allin``). Bets are sized and clipped by
 ``play.real_incr``, exactly like our own. Seats alternate every hand, as they
 do against Slumbot.
+
+**Deals.** Each hand's deck comes from its own generator, keyed by the seed
+and the hand, not from the stream the opponent's moves draw from. So two runs
+with one seed are dealt the same hands however the agents act, and agent
+variants can be compared hand by hand. With ``duplicate``, hands ``2k`` and
+``2k + 1`` share pair ``k``'s deck; as the seats alternate, the second replays
+the first with the seats and the hole cards swapped.
 """
 
 from __future__ import annotations
@@ -30,15 +37,24 @@ _rank7 = jax.jit(hand_rank7)
 
 
 class RandomOpponent:
-  def __init__(self, bins: np.ndarray, seed: int = 0) -> None:
+  def __init__(self, bins: np.ndarray, seed: int = 0, duplicate: bool = False) -> None:
     self.bins = np.asarray(bins)
+    self.seed, self.duplicate = seed, duplicate
     self.rng = np.random.default_rng(seed)
     self.n_requests = 0
     self.n_hands = 0
 
+  def deal_index(self) -> int:
+    """The deal of the next hand: the hand, or its pair under ``duplicate``."""
+    return self.n_hands // 2 if self.duplicate else self.n_hands
+
+  def deal_rng(self, stream: int = 0) -> np.random.Generator:
+    """A generator of the next hand's deal only; ``stream`` tells its uses apart."""
+    return np.random.default_rng([self.seed, self.deal_index(), stream])
+
   def new_hand(self) -> dict[str, Any]:
     self.n_requests += 1
-    deck = self.rng.permutation(52)
+    deck = self.deal_rng(0).permutation(52)
     self.cards = [_RANKS[c // 4] + _SUITS[c % 4] for c in deck[:9]]
     self.deck = deck[:9]
     # client_pos 1 (we are the button) on even hands, as Slumbot alternates.
