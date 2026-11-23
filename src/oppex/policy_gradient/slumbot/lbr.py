@@ -36,10 +36,16 @@ the decisions where they do not.
 ``AlwaysCallOpponent``) the LBR code is checked without Slumbot. The paper's
 Table 2 gives 34.0 ± 0.5 BB/h for fcpa on all streets, 49.0 ± 0.4 for fcpa on
 streets 3-4, and 0 for fc.
+
+**Against the ACPC chumps** (``RealLBR`` with ``ChumpOpponent``, from
+``scripts/policy_gradient/lbr_chumps.py``) LBR plays on the real game alone:
+the chumps raise to any chip total, which the env tree cannot follow. The
+decision rule and the bet sizing are the code above.
 """
 
 from __future__ import annotations
 
+import copy
 from collections import Counter
 
 import numpy as np
@@ -51,7 +57,7 @@ from ..resolving import _view, compatible, showdown_sign
 from .agent import SlumbotResolvingAgent
 from .api import STACK_SIZE
 from .model import our_token
-from .play import RealGame, TreeAgent, atom_name, card_index, real_incr
+from .play import RealGame, TreeAgent, atom_name, card_index, real_incr, tokenize
 from .random_opponent import RandomOpponent
 from .rollouts import _advance
 
@@ -365,3 +371,160 @@ class LBRAgent(_LBR, TreeAgent):
 
   def summary(self) -> str:
     return self.lbr_summary()
+
+
+# ── Against ACPC chumps, in the real game ────────────────────────────────────
+
+
+# The chumps of the paper's Table 2 as (fold, call, raise) probabilities of
+# the ACPC example player.
+CHUMPS = {
+  "always_call": (0.0, 1.0, 0.0),
+  "call_raise": (0.0, 0.5, 0.5),
+  "random": (1 / 3, 1 / 3, 1 / 3),
+}
+# The pot fractions of each bet set; ``bins`` are the checkpoint's.
+BET_FRACTIONS = {"fc": (), "fcpa": (1.0,), "bins": (0.5, 1.0, 1.5, 2.0)}
+
+
+def raise_range(g: RealGame, seat: int) -> tuple[int, int] | None:
+  """``seat``'s legal raise-to street totals ``(lo, hi)``, or None if it cannot raise.
+
+  The minimum raise is the last increment (at least a big blind), and an
+  all-in below it is still a raise, as in the ACPC rules and Slumbot's.
+  """
+  call, stack = g.call_amount(seat), g.stack(seat)
+  if stack <= call or g.stack(1 - seat) <= 0:
+    return None
+  top = max(g.street_committed)
+  hi = top + stack - call
+  return min(top + g.min_raise(), hi), hi
+
+
+class ChumpOpponent(RandomOpponent):
+  """An ACPC example-player chump behind Slumbot's client interface.
+
+  At each decision it draws an action type with probabilities ``probs`` =
+  (fold, call, raise), renormalised over the valid types: folding is valid
+  only facing a bet, raising only while both players have chips behind. A
+  raise is to a uniformly random street total between the minimum raise and
+  the all-in, in whole chips. Its play ignores its cards, so its range is
+  every hand compatible with the public cards and ours, whatever it did.
+  Deals and seats are ``RandomOpponent``'s, so ``duplicate`` works the same
+  way.
+  """
+
+  def __init__(self, probs, seed: int = 0, duplicate: bool = False) -> None:
+    super().__init__(np.zeros(0), seed, duplicate)
+    self.probs = np.asarray(probs, np.float64)
+
+  def type_probs(self, g: RealGame, seat: int) -> np.ndarray:
+    """(fold, call, raise) probabilities of ``seat``'s next action in ``g``."""
+    valid = np.array([g.call_amount(seat) > 0, True, raise_range(g, seat) is not None])
+    p = self.probs * valid
+    return p / p.sum()
+
+  def _bot_moves(self):
+    bot = 1 - self.client_seat
+    while not self.game.done and self.game.cur == bot:
+      g = self.game
+      kind = int(self.rng.choice(3, p=self.type_probs(g, bot)))
+      if kind == 0:
+        tok = "f"
+      elif kind == 1:
+        tok = "c" if g.call_amount(bot) > 0 else "k"
+      else:
+        lo, hi = raise_range(g, bot)
+        tok = f"b{int(self.rng.integers(lo, hi + 1))}"
+      self._apply(tok)
+    return self._response()
+
+
+class RealLBR:
+  """LBR deciding on the real game alone, against a ``ChumpOpponent``.
+
+  The env tree cannot follow a chump's raises of any chip size: translated
+  onto atoms it drifts from the real game, and ``play.play_hand`` then
+  check/calls. Against a chump nothing needs the tree. The range is every
+  compatible hand, and the fold probability after our bet is the chump's own
+  rule on the real game after it, so the model is exact. Candidates and chips
+  are ``_LBR``'s: pot fractions of the real pot by ``play.real_incr``, plus
+  the all-in, each distinct total once, and the decision is ``lbr_values`` and
+  ``lbr_choice``.
+  """
+
+  def __init__(self, ev, bets: str = "fcpa", call_streets: int = 0) -> None:
+    if bets not in BET_FRACTIONS:
+      raise ValueError(f"unknown bet set {bets!r}, expected one of {BET_SETS}")
+    self.ev, self.bets, self.call_streets = ev, bets, int(call_streets)
+    self.bins = np.asarray(BET_FRACTIONS[bets], np.float64)
+    # Smallest bets first, so that ties go to the smaller bet.
+    self.atoms = [NUM_POINT_ATOMS + i for i in range(len(self.bins))] + (
+      [ALL_IN] if bets != "fc" else [])
+    self.stats = {"decisions": 0, "choices": Counter()}
+
+  def decide(self, g: RealGame, seat: int, cards, board, chump: ChumpOpponent) -> tuple[str, dict | None]:
+    """Our token in ``g``, and the decision's record (None when only called)."""
+    call = g.call_amount(seat)
+    check_call = "c" if call > 0 else "k"
+    if g.street < self.call_streets:
+      return check_call, None
+
+    # Each candidate bet's token, raise beyond the call, and fold probability.
+    c_us, c_op = g.committed[seat], g.committed[1 - seat]
+    bets, seen = {}, set()
+    for atom in self.atoms:
+      tok, _ = real_incr(g, seat, atom, self.bins)
+      if tok[0] != "b" or tok in seen:
+        continue
+      seen.add(tok)
+      after = copy.deepcopy(g)
+      after.apply("b", int(tok[1:]))
+      fold = chump.type_probs(after, 1 - seat)[0]
+      bets[tok] = (_committed_after(g, seat, tok) - c_op, np.full(N_HANDS, fold))
+
+    r = compatible(cards, board)
+    sign = showdown_sign(cards, board, self.ev)
+    values, info = lbr_values(r, sign, c_us + c_op, c_op - c_us, bets)
+    choice = lbr_choice(values, c_op - c_us)
+    tok = {FOLD: "f", CALL: check_call}.get(choice, choice)
+    name = {"f": "fold", "c": "call", "k": "call"}.get(tok, "allin" if
+            _committed_after(g, seat, tok) == STACK_SIZE else "bet")
+    self.stats["decisions"] += 1
+    self.stats["choices"][name] += 1
+    key = lambda a: "call" if a == CALL else a
+    return tok, {"choice": name, "token": tok, "pot": c_us + c_op, "asked": c_op - c_us,
+                 "U": {key(a): round(v, 3) for a, v in values.items()},
+                 "fp_wp": {key(a): [round(x, 5) for x in v] for a, v in info.items()}}
+
+  def summary(self) -> str:
+    choices = ", ".join(f"{k} {v}" for k, v in self.stats["choices"].most_common())
+    return (f"LBR {self.bets} on the real game, check/call on the first "
+            f"{self.call_streets} streets: {self.stats['decisions']} decisions ({choices})")
+
+
+def play_chump_hand(client: ChumpOpponent, lbr: RealLBR) -> dict:
+  """One hand of ``lbr`` against the chump, through the client interface."""
+  r = client.new_hand()
+  seat = 1 - r["client_pos"]
+  hole = [card_index(c) for c in r["hole_cards"]]
+  g, history, records = RealGame(), "", []
+  while True:
+    action = r.get("action", "")
+    assert action.startswith(history), (history, action)
+    for kind, to in tokenize(action[len(history):]):
+      if not g.done:
+        g.apply(kind, to)
+    history = action
+    if "winnings" in r:
+      return {"client_pos": r["client_pos"], "seat": seat, "hole_cards": r["hole_cards"],
+              "board": r.get("board", []), "bot_hole_cards": r.get("bot_hole_cards"),
+              "action": action, "winnings": r["winnings"], "lbr": records}
+    assert not g.done and g.cur == seat, (action, g.__dict__)
+    board = [card_index(c) for c in r.get("board", [])]
+    tok, rec = lbr.decide(g, seat, hole, board, client)
+    if rec is not None:
+      records.append({"street": g.street, **rec})
+    g.apply(tok[0], int(tok[1:]) if tok[0] == "b" else None)
+    history += tok
+    r = client.act(tok)

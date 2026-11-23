@@ -219,7 +219,7 @@ def main():
 
   # ── 5. Save and play ───────────────────────────────────────────────────────
   pol = ExploiterPolicy.from_solution(tr, sol_sigma, sol_tau, args.factor)
-  file = os.path.join(out_dir, f"solution_{tag}_n{args.games}_it{args.iters}.npz")
+  file = os.path.join(out_dir, f"solution_{tag}_n{args.games}_it{args.iters}_{lv.CARD_ORDER}.npz")
   pol.save(file, checkpoint=bp.checkpoint, seats=np.asarray(args.seats))
   print(f"  saved {file}")
   if set(args.seats) != {0, 1}:
