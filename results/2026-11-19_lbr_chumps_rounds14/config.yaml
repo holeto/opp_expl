@@ -1,0 +1,82 @@
+# Configuration of one experiment. command: the CLI call per seed ({seed} is the seed);
+# resolved_args: every argument after argparse defaults, read off the current CLI. Flags
+# added after the run (e.g. --trace-refusals) appear at their defaults, which keep the
+# behaviour the run had. Seeds and output paths are in command.
+# Raw data paths are relative to the project directory (local or on the cluster).
+experiment: 2026-11-19_lbr_chumps_rounds14
+question: LBR against the raising chumps on all four rounds
+checkpoint: null
+opponent: ACPC-style chumps (call_raise, random)
+agent:
+  type: LBR on the real game
+  settings:
+    rule: RealLBR (slumbot/lbr.py) on the real game; the chump is an exact model (uniform range, the chump's own fold probability after our bet)
+    chumps: 'ChumpOpponent as the ACPC example player: action type drawn with (fold, call, raise) probabilities renormalised over valid types; raise to a street total uniform in chips between the min raise and all-in. always_call (0,1,0), call_raise (0,.5,.5), random (1/3,1/3,1/3). The paper''s raise sizing is unknown; this is our assumption.'
+code:
+  exact_commit: null
+  after_commit: ea4c8ec
+  committed_in: 7af5dd1
+  how_known: 'inferred from dates: the run used the working tree synced to the cluster, not a commit; no commit hash is logged'
+jobs:
+- id: 12063151
+  name: lbr_chumps_r14_cpu
+  start: 2026-11-19T13:37
+  end: 2026-11-19T14:04
+  tasks: 80
+  state: COMPLETED
+  partition: cpufast
+  time_limit: 02:00:00
+  cpus_per_task: 2
+  mem: 4G
+  array: 0-79 (0-19 call_raise fc, 20-39 call_raise fcpa, 40-59 random fc, 60-79 random fcpa)
+  job_script: unchanged since the run (last modified before the job started)
+variants:
+- name: call_raise_fc_c0
+  command: lbr_chumps.py --chump call_raise --bets fc --call-streets 0 --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_fc_c0_s{seed}.jsonl
+  seeds: 6000-6019
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+- name: call_raise_fcpa_c0
+  command: lbr_chumps.py --chump call_raise --bets fcpa --call-streets 0 --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_fcpa_c0_s{seed}.jsonl
+  seeds: 6020-6039
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+- name: random_fc_c0
+  command: lbr_chumps.py --chump random --bets fc --call-streets 0 --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_fc_c0_s{seed}.jsonl
+  seeds: 6040-6059
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: random
+    duplicate: true
+    hands: 1000
+- name: random_fcpa_c0
+  command: lbr_chumps.py --chump random --bets fcpa --call-streets 0 --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_fcpa_c0_s{seed}.jsonl
+  seeds: 6060-6079
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: random
+    duplicate: true
+    hands: 1000
+pooling: pool.py (run in the cluster's lbr_chumps output directory)
+raw_data:
+  cluster:
+  - <cluster scratch>/slumbot/p5/lbr_chumps/<chump>_<bets>_c0_s<seed>.jsonl (outside the project directory)
+  local: []

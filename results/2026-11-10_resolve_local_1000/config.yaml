@@ -1,0 +1,83 @@
+# Configuration of one experiment. command: the CLI call per seed ({seed} is the seed);
+# resolved_args: every argument after argparse defaults, read off the current CLI. Flags
+# added after the run (e.g. --trace-refusals) appear at their defaults, which keep the
+# behaviour the run had. Seeds and output paths are in command.
+# Raw data paths are relative to the project directory (local or on the cluster).
+experiment: 2026-11-10_resolve_local_1000
+question: Does LocalSlumbot (the local library, hidden u per hand) play like slumbot.com?
+checkpoint: checkpoints/qmmd_hunl_560k/step_00560000.pkl (params)
+opponent: LocalSlumbot (local library), hidden translation draw u per hand
+agent:
+  type: re-solver
+  settings:
+    blueprint: checkpoints/qmmd_hunl_560k/step_00560000.pkl (params); 4 bet bins 0.5/1/1.5/2 pot, 200 BB stacks
+    opponent_model: Slumbot's exact strategy (--model slumbot), marginalised over the per-hand translation draw u
+    subgame: depth plies below the current state (--depth); matrix leaves at the depth limit and at every street close; min_mass 1e-4
+    continuations: 'rollouts: 4 (blueprint and its fold/call/raise biases, factor 5); checkdown: 1 (both check/call to showdown)'
+    leaf_values: 'rollouts: --leaf-games games per leaf and continuation, chunks of 32 leaves, common random numbers, real Slumbot chips (real_chips=True); checkdown: exact showdown equity in real chips per world (real_checkdown_payoffs)'
+    solver: single-hand infoset CFR, DCFR (alpha 1.5, beta 0, gamma 2), --cfr-iters iterations
+    terminal_payoffs: real Slumbot chips at folds and showdowns inside the subgame
+    preflop_ev: equity.preflop_ev_matrix(n_boards=200_000)
+    call_streets: --call-streets N checks or calls every decision on the first N streets
+code:
+  exact_commit: null
+  after_commit: 693b15d
+  committed_in: 4a456b2
+  how_known: 'inferred from dates: the run used the working tree synced to the cluster, not a commit; no commit hash is logged'
+jobs:
+- id: 11996177
+  name: slumbot_resolve_local1000_cpu
+  start: 2026-11-10T12:02
+  end: 2026-11-10T13:34
+  tasks: 10
+  state: COMPLETED
+  partition: cpufast
+  time_limit: 04:00:00
+  cpus_per_task: 4
+  mem: 32G
+  array: 0-9
+  job_script: unchanged since the run (last modified before the job started)
+variants:
+- name: base
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --resolve --model slumbot --opponent local --hands 100 --seed {seed} --save-solves --out checkpoints/qmmd_hunl_560k/local/resolve_local1000_s{seed}.jsonl
+  seeds: 100-109
+  hands_per_seed: 100
+  total_hands: 1000
+  evaluation:
+    command: aivat_resolve_slumbot.py checkpoints/qmmd_hunl_560k checkpoints/qmmd_hunl_560k/local/resolve_local1000_s{seed}.jsonl --seed {i} --out checkpoints/qmmd_hunl_560k/local/resolve_local1000_s{seed}.aivat.jsonl
+    seeds: i = seed - 100
+    resolved_args:
+      cfr_iters: 500
+      checkpoint: null
+      depth: 4
+      duplicate: false
+      leaf_games: 128
+      leaf_mode: rollouts
+      params: params
+      report: null
+      run_dir: checkpoints/qmmd_hunl_560k
+      tasks: 1
+  resolved_args:
+    call_streets: 0
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: false
+    exploiter: null
+    hands: 100
+    lbr: null
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: slumbot
+    opponent: local
+    params: params
+    resolve: true
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: true
+    trace_refusals: false
+pooling: aivat_resolve_slumbot.py checkpoints/qmmd_hunl_560k --report checkpoints/qmmd_hunl_560k/local/resolve_local1000_s*.aivat.jsonl
+raw_data:
+  cluster:
+  - checkpoints/qmmd_hunl_560k/local/resolve_local1000_s1{00-09}.{jsonl,solves,aivat.jsonl}
+  local: []

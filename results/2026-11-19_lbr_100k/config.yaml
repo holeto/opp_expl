@@ -1,0 +1,165 @@
+# Configuration of one experiment. command: the CLI call per seed ({seed} is the seed);
+# resolved_args: every argument after argparse defaults, read off the current CLI. Flags
+# added after the run (e.g. --trace-refusals) appear at their defaults, which keep the
+# behaviour the run had. Seeds and output paths are in command.
+# Raw data paths are relative to the project directory (local or on the cluster).
+experiment: 2026-11-19_lbr_100k
+question: Local best response against LocalSlumbot (paper Table 3), on the deals of the 100k DLBR runs
+checkpoint: checkpoints/qmmd_hunl_560k/step_00560000.pkl (params)
+opponent: LocalSlumbot; always_call chump for the fcpa_c0_always_call variant
+agent:
+  type: LBR
+  settings:
+    rule: Lisý & Bowling 2017, Figure 1 (slumbot/lbr.py)
+    opponent_model: the same Slumbot model as the re-solver (range over Slumbot's hands, marginalised over u), real chips
+    win_probability: exact runout enumeration against the range (checkdown)
+    bets: 'fc: fold/call; fcpa: + pot and all-in; bins: + 0.5/1/1.5/2 pot and all-in'
+code:
+  exact_commit: null
+  after_commit: ea4c8ec
+  committed_in: ea4c8ec
+  how_known: 'inferred from dates: the run used the working tree synced to the cluster, not a commit; no commit hash is logged'
+  note: ea4c8ec was committed 3 min before the job started, so the run very likely used exactly it
+jobs:
+- id: 12061528
+  name: slumbot_lbr_local100k_cpu
+  start: 2026-11-19T09:49
+  end: 2026-11-19T11:35
+  tasks: 410
+  state: COMPLETED
+  partition: cpufast
+  time_limit: 02:00:00
+  cpus_per_task: 4
+  mem: 8G
+  array: 0-409%40; 4 seeds per task (0-99 fcpa_c2, 100-199 fc_c2, 200-299 fc_c0, 300-399 bins_c2, 400-409 fcpa_c0_always_call)
+  job_script: unchanged since the run (last modified before the job started)
+variants:
+- name: fcpa_c2
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr fcpa --call-streets 2 --opponent local --duplicate --hands 250 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_fcpa_c2_s{seed}.jsonl
+  seeds: 2000-2399
+  hands_per_seed: 250
+  total_hands: 100000
+  check: validate_lbr.py --logs <log> (range calibration, per seed)
+  resolved_args:
+    call_streets: 2
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 250
+    lbr: fcpa
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: local
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+- name: fc_c2
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr fc --call-streets 2 --opponent local --duplicate --hands 250 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_fc_c2_s{seed}.jsonl
+  seeds: 2000-2399
+  hands_per_seed: 250
+  total_hands: 100000
+  check: validate_lbr.py --logs <log> (range calibration, per seed)
+  resolved_args:
+    call_streets: 2
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 250
+    lbr: fc
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: local
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+- name: fc_c0
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr fc --call-streets 0 --opponent local --duplicate --hands 250 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_fc_c0_s{seed}.jsonl
+  seeds: 2000-2399
+  hands_per_seed: 250
+  total_hands: 100000
+  check: validate_lbr.py --logs <log> (range calibration, per seed)
+  resolved_args:
+    call_streets: 0
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 250
+    lbr: fc
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: local
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+- name: bins_c2
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr bins --call-streets 2 --opponent local --duplicate --hands 250 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_bins_c2_s{seed}.jsonl
+  seeds: 2000-2399
+  hands_per_seed: 250
+  total_hands: 100000
+  check: validate_lbr.py --logs <log> (range calibration, per seed)
+  resolved_args:
+    call_streets: 2
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 250
+    lbr: bins
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: local
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+- name: fcpa_c0_always_call
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr fcpa --call-streets 0 --opponent always_call --duplicate --hands 500 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_fcpa_c0_always_call_s{seed}.jsonl
+  seeds: 4000-4039
+  hands_per_seed: 500
+  total_hands: 20000
+  resolved_args:
+    call_streets: 0
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 500
+    lbr: fcpa
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: always_call
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+pooling: pool.py (run from the project root on the cluster)
+raw_data:
+  cluster:
+  - checkpoints/qmmd_hunl_560k/local/lbr100k_<variant>_s<seed>.jsonl
+  local: []
