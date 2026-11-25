@@ -11,6 +11,8 @@ Details: `notes/br_against_slumbot.md`, section "2026-11-19: local best response
 | fcpa, all streets, vs always-call (20 000 hands) | **+34.7 ± 1.0 BB/hand** | 34.0 ± 0.5 |
 | cd_call2 (DLBR, `2026-11-13_cd_call2_100k`) | +2874 ± 169 | — |
 
+- The paper's Slumbot 2016 is a different bot from ours (confirmed by David Milec, 2026-11-24), so its column is context, not a target. Milec et al. (arXiv:2112.12594, Table 2): LBR with FCPA against our Slumbot 1388 ± 150, their CDBR 1774 ± 137 (95% intervals). Our fcpa 1-4 on the same deals is in `2026-11-24_lbr_fcpa14_100k` (+1683 ± 211).
+
 | Paired by deal (same 100 000 deals) | Difference | sd (BB), corr |
 |---|---|---|
 | LBR fcpa − cd_call2 | **−982 ± 155** | 25.06, +0.55 |

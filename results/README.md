@@ -42,6 +42,8 @@ Both are inferred from dates. From now on, a run should log `git rev-parse HEAD`
 | `2026-11-19_lbr_100k` | LBR fc/fcpa/bins vs LocalSlumbot, 100 000 hands each | fcpa 3-4 +1892 ± 157, bins 3-4 +2258 ± 161 (raw) |
 | `2026-11-19_lbr_chumps_rounds34` | LBR vs the paper's chumps, rounds 3-4 (local) | always call fcpa 48.9 ± 1.0 BB/hand (paper 49.0) |
 | `2026-11-19_lbr_chumps_rounds14` | LBR vs the raising chumps, rounds 1-4 | see summary; the raising chumps don't match the paper |
+| `2026-11-24_lbr_fcpa14_100k` | LBR fcpa 1-4 vs LocalSlumbot, 100 000 hands | +1683 ± 211 (raw; Milec 1388 ± 150) |
+| `2026-11-24_lbr_chumps_bb` | LBR vs chumps with raises in BB, and a chump uniform over every legal action | uniform (chips) matches the paper's random chump in all 4 cells, e.g. fcpa 3-4 80.2 ± 1.8 BB/hand (paper 80.7) |
 
 The 100k runs and the LocalSlumbot rows of `2026-11-19_lbr_100k` use seeds 2000–2399. They play the same deals, so they compare deal by deal.
 

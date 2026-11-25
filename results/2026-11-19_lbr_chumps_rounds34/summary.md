@@ -14,3 +14,4 @@ Details: `notes/br_against_slumbot.md`, section "2026-11-19: LBR against the chu
 | random, fc 3-4 | **5.5 ± 1.6** | 10 000 | 2.2 ± 0.7 |
 
 - Always call matches in both code paths. The raising chumps do not; the likely cause is the chumps' raise-size distribution, which the paper does not give (open question to Lisý).
+- **Update 2026-11-24:** the paper's random chump is uniform over every legal action (each raise size one action), not 1/3 per action type; that chump matches all four cells. Raises in big blinds change nothing. See `2026-11-24_lbr_chumps_bb`.

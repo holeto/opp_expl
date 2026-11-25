@@ -1,0 +1,62 @@
+# Configuration of one experiment. command: the CLI call per seed ({seed} is the seed);
+# resolved_args: every argument after argparse defaults, read off the current CLI.
+# Raw data paths are relative to the project directory (local or on the cluster).
+experiment: 2026-11-24_lbr_fcpa14_100k
+question: LBR fcpa on all four rounds against LocalSlumbot, to compare with David Milec's 1388 ± 150 against the same Slumbot
+checkpoint: checkpoints/qmmd_hunl_560k/step_00560000.pkl (params)
+opponent: LocalSlumbot
+reference: Milec, Kubíček et al., arXiv:2112.12594v7 (notes/Continual_depth_limited_responses.pdf), Table 2, page 8. LBR with FCPA against this Slumbot 1388 ± 150 mbb/hand, CDBR 1774 ± 137 (95% intervals); hand count, duplicate scheme and game rules not given in the paper
+agent:
+  type: LBR
+  settings:
+    rule: Lisý & Bowling 2017, Figure 1 (slumbot/lbr.py)
+    opponent_model: the same Slumbot model as the re-solver (range over Slumbot's hands, marginalised over u), real chips
+    win_probability: exact runout enumeration against the range (checkdown); preflop from the preflop EV matrix
+    bets: 'fcpa: fold, call, pot and all-in, on every street'
+code:
+  exact_commit: 01add65
+  how_known: the cluster's LBR sources (lbr.py, play.py, local.py, model.py, random_opponent.py, native.py, validate_lbr.py, play_slumbot.py) had the same md5 as the local files at submission, and the local src/ and scripts/ were clean at 01add65
+jobs:
+- id: 12085029
+  name: slumbot_lbr_fcpa14_cpu
+  start: 2026-11-24T14:08
+  end: 2026-11-24T14:38
+  tasks: 100
+  state: COMPLETED
+  partition: cpufast
+  time_limit: 02:00:00
+  cpus_per_task: 4
+  mem: 8G
+  array: 0-99%40; 4 seeds per task
+  elapsed_per_task: 9-11 min
+variants:
+- name: fcpa_c0
+  command: play_slumbot.py checkpoints/qmmd_hunl_560k --lbr fcpa --call-streets 0 --opponent local --duplicate --hands 250 --seed {seed} --out checkpoints/qmmd_hunl_560k/local/lbr100k_fcpa_c0_s{seed}.jsonl
+  seeds: 2000-2399
+  hands_per_seed: 250
+  total_hands: 100000
+  check: validate_lbr.py --logs <log> (range calibration, per seed and pooled)
+  resolved_args:
+    call_streets: 0
+    cfr_iters: 500
+    checkpoint: null
+    depth: 4
+    duplicate: true
+    exploiter: null
+    hands: 250
+    lbr: fcpa
+    leaf_games: 128
+    leaf_mode: rollouts
+    min_interval: 1.0
+    model: blueprint
+    opponent: local
+    params: params
+    resolve: false
+    run_dir: checkpoints/qmmd_hunl_560k
+    save_solves: false
+    trace_refusals: false
+pooling: pool.py (run from the project root on the cluster; loads the other 100k runs for the paired comparisons)
+raw_data:
+  cluster:
+  - checkpoints/qmmd_hunl_560k/local/lbr100k_fcpa_c0_s{2000-2399}.jsonl
+  local: []

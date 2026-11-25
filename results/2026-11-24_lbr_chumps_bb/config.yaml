@@ -1,0 +1,245 @@
+# Configuration of one experiment. command: the CLI call per seed ({seed} is the seed);
+# resolved_args: every argument after argparse defaults, read off the current CLI.
+# Raw data paths are relative to the project directory (local or on the cluster).
+experiment: 2026-11-24_lbr_chumps_bb
+question: Which raise distribution are the paper's raising chumps? Raises in whole big blinds instead of chips, and a chump uniform over every legal action (the authors' description of the random chump)
+checkpoint: null
+opponent: chumps (call_raise and random with raises in big blinds; uniform over every legal action, raises in chips and in big blinds)
+reference: Lisý & Bowling 2017 (notes/Local_best_response.pdf), Table 2
+agent:
+  type: LBR on the real game
+  settings:
+    rule: RealLBR (slumbot/lbr.py) on the real game, 20 000-chip stacks, 50/100 blinds; the chump is an exact model (uniform range, the chump's own fold probability after our bet)
+    chumps: 'ChumpOpponent. call_raise (0, .5, .5) and random (1/3 each): action type drawn first, renormalised over valid types, then a raise size uniform over raise_sizes. uniform: every legal action equally likely (fold when facing a bet, check/call, each raise size). raise_sizes: raise beyond the call = k steps of 1 chip (chip) or 100 chips (bb), from the legal minimum raise (floor min) to all-in, the last step clipped onto the all-in'
+code:
+  exact_commit: null
+  after_commit: 01add65
+  uncommitted: src/oppex/policy_gradient/slumbot/lbr.py (raise_sizes, raise_step, raise_floor, uniform chump) and scripts/policy_gradient/lbr_chumps.py (--raise-step, --raise-floor)
+  how_known: the cluster's lbr.py and lbr_chumps.py had the same md5 as the local working tree at submission (262d15db…, 65103f96…); with the default flags the new code replays 200 hands of the earlier random fc 3-4 run (seed 11) exactly
+jobs:
+- id: 12088968
+  name: lbr_chumps_bb_cpu
+  start: 2026-11-24T20:58
+  end: 2026-11-24T21:26
+  tasks: 320 (319 completed; task 188, uniform chip fcpa 1-4 seed 7188, was requeued by a node fault, held by the admins and cancelled on 2026-11-25 without running)
+  state: COMPLETED except task 188 CANCELLED
+  partition: cpufast
+  time_limit: 02:00:00
+  cpus_per_task: 2
+  mem: 4G
+  array: 0-319; 20 tasks per cell, cells in the order of variants
+  elapsed_per_task: 20-28 min for fc 1-4, 8-10 min for call_raise fcpa 1-4, under 5 min otherwise
+variants:
+- name: call_raise_bb_fc_c0
+  command: lbr_chumps.py --chump call_raise --bets fc --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_bb_min_fc_c0_s{seed}.jsonl
+  seeds: 7000-7019
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: call_raise_bb_fcpa_c0
+  command: lbr_chumps.py --chump call_raise --bets fcpa --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_bb_min_fcpa_c0_s{seed}.jsonl
+  seeds: 7020-7039
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: call_raise_bb_fc_c2
+  command: lbr_chumps.py --chump call_raise --bets fc --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_bb_min_fc_c2_s{seed}.jsonl
+  seeds: 7040-7059
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 2
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: call_raise_bb_fcpa_c2
+  command: lbr_chumps.py --chump call_raise --bets fcpa --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/call_raise_bb_min_fcpa_c2_s{seed}.jsonl
+  seeds: 7060-7079
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 2
+    chump: call_raise
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: random_bb_fc_c0
+  command: lbr_chumps.py --chump random --bets fc --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_bb_min_fc_c0_s{seed}.jsonl
+  seeds: 7080-7099
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: random
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: random_bb_fcpa_c0
+  command: lbr_chumps.py --chump random --bets fcpa --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_bb_min_fcpa_c0_s{seed}.jsonl
+  seeds: 7100-7119
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: random
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: random_bb_fc_c2
+  command: lbr_chumps.py --chump random --bets fc --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_bb_min_fc_c2_s{seed}.jsonl
+  seeds: 7120-7139
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 2
+    chump: random
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: random_bb_fcpa_c2
+  command: lbr_chumps.py --chump random --bets fcpa --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/random_bb_min_fcpa_c2_s{seed}.jsonl
+  seeds: 7140-7159
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 2
+    chump: random
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: uniform_chip_fc_c0
+  command: lbr_chumps.py --chump uniform --bets fc --call-streets 0 --raise-step chip --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_chip_min_fc_c0_s{seed}.jsonl
+  seeds: 7160-7179
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: chip
+- name: uniform_chip_fcpa_c0
+  command: lbr_chumps.py --chump uniform --bets fcpa --call-streets 0 --raise-step chip --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_chip_min_fcpa_c0_s{seed}.jsonl
+  seeds: 7180-7199 except 7188 (cancelled)
+  hands_per_seed: 1000
+  total_hands: 19000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: chip
+- name: uniform_chip_fc_c2
+  command: lbr_chumps.py --chump uniform --bets fc --call-streets 2 --raise-step chip --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_chip_min_fc_c2_s{seed}.jsonl
+  seeds: 7200-7219
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 2
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: chip
+- name: uniform_chip_fcpa_c2
+  command: lbr_chumps.py --chump uniform --bets fcpa --call-streets 2 --raise-step chip --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_chip_min_fcpa_c2_s{seed}.jsonl
+  seeds: 7220-7239
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 2
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: chip
+- name: uniform_bb_fc_c0
+  command: lbr_chumps.py --chump uniform --bets fc --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_bb_min_fc_c0_s{seed}.jsonl
+  seeds: 7240-7259
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 0
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: uniform_bb_fcpa_c0
+  command: lbr_chumps.py --chump uniform --bets fcpa --call-streets 0 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_bb_min_fcpa_c0_s{seed}.jsonl
+  seeds: 7260-7279
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 0
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: uniform_bb_fc_c2
+  command: lbr_chumps.py --chump uniform --bets fc --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_bb_min_fc_c2_s{seed}.jsonl
+  seeds: 7280-7299
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fc
+    call_streets: 2
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+- name: uniform_bb_fcpa_c2
+  command: lbr_chumps.py --chump uniform --bets fcpa --call-streets 2 --raise-step bb --raise-floor min --hands 1000 --duplicate --seed {seed} --out <cluster>/lbr_chumps/uniform_bb_min_fcpa_c2_s{seed}.jsonl
+  seeds: 7300-7319
+  hands_per_seed: 1000
+  total_hands: 20000
+  resolved_args:
+    bets: fcpa
+    call_streets: 2
+    chump: uniform
+    duplicate: true
+    hands: 1000
+    raise_floor: min
+    raise_step: bb
+pooling: pool.py (run with the cluster's lbr_chumps output directory as argument)
+raw_data:
+  cluster:
+  - <cluster scratch>/slumbot/p5/lbr_chumps/<chump>_<step>_min_<bets>_c<cs>_s<seed>.jsonl (outside the project directory)
+  local: []

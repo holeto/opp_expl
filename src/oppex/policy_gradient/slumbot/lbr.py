@@ -55,7 +55,7 @@ from ...cfr.subgame import expand_node, replay_betting
 from ...envs.betting import ALL_IN, CALL, FOLD, NUM_POINT_ATOMS
 from ..resolving import _view, compatible, showdown_sign
 from .agent import SlumbotResolvingAgent
-from .api import STACK_SIZE
+from .api import BIG_BLIND, STACK_SIZE
 from .model import our_token
 from .play import RealGame, TreeAgent, atom_name, card_index, real_incr, tokenize
 from .random_opponent import RandomOpponent
@@ -377,28 +377,43 @@ class LBRAgent(_LBR, TreeAgent):
 
 
 # The chumps of the paper's Table 2 as (fold, call, raise) probabilities of
-# the ACPC example player.
+# the ACPC example player. ``uniform`` has none: every legal action is equally
+# likely, each raise size counting as one action, so it raises almost always.
 CHUMPS = {
   "always_call": (0.0, 1.0, 0.0),
   "call_raise": (0.0, 0.5, 0.5),
   "random": (1 / 3, 1 / 3, 1 / 3),
+  "uniform": None,
 }
+# The chips between consecutive raise sizes of a chump.
+RAISE_STEPS = {"chip": 1, "bb": BIG_BLIND}
+# The smallest raise of a chump: the legal minimum raise, or one step.
+RAISE_FLOORS = ("min", "step")
 # The pot fractions of each bet set; ``bins`` are the checkpoint's.
 BET_FRACTIONS = {"fc": (), "fcpa": (1.0,), "bins": (0.5, 1.0, 1.5, 2.0)}
 
 
-def raise_range(g: RealGame, seat: int) -> tuple[int, int] | None:
-  """``seat``'s legal raise-to street totals ``(lo, hi)``, or None if it cannot raise.
+def raise_sizes(g: RealGame, seat: int, step: int = 1, floor: str = "min") -> np.ndarray | None:
+  """``seat``'s raise-to street totals a chump draws from, or None if it cannot raise.
 
-  The minimum raise is the last increment (at least a big blind), and an
-  all-in below it is still a raise, as in the ACPC rules and Slumbot's.
+  The raise beyond the call is a whole number of ``step`` chips, from the
+  floor up to the all-in, the last step clipped onto the all-in. The ``min``
+  floor is the ACPC and Slumbot minimum raise: the last increment, at least a
+  big blind, and an all-in below it is still a raise. The ``step`` floor
+  allows raises below the minimum. With ``step=1`` and ``floor="min"`` these
+  are the ACPC example player's sizes.
   """
   call, stack = g.call_amount(seat), g.stack(seat)
   if stack <= call or g.stack(1 - seat) <= 0:
     return None
-  top = max(g.street_committed)
-  hi = top + stack - call
-  return min(top + g.min_raise(), hi), hi
+  if floor not in RAISE_FLOORS:
+    raise ValueError(f"unknown raise floor {floor!r}, expected one of {RAISE_FLOORS}")
+  room = stack - call
+  lo = g.min_raise() if floor == "min" else step
+  k_lo, k_hi = -(-lo // step), -(-room // step)
+  # A floor above the stack leaves the all-in alone.
+  ks = np.arange(k_lo, max(k_lo, k_hi) + 1)
+  return max(g.street_committed) + np.minimum(ks * step, room)
 
 
 class ChumpOpponent(RandomOpponent):
@@ -407,21 +422,29 @@ class ChumpOpponent(RandomOpponent):
   At each decision it draws an action type with probabilities ``probs`` =
   (fold, call, raise), renormalised over the valid types: folding is valid
   only facing a bet, raising only while both players have chips behind. A
-  raise is to a uniformly random street total between the minimum raise and
-  the all-in, in whole chips. Its play ignores its cards, so its range is
-  every hand compatible with the public cards and ours, whatever it did.
-  Deals and seats are ``RandomOpponent``'s, so ``duplicate`` works the same
-  way.
+  raise is to a uniformly random size of ``raise_sizes``. With ``probs=None``
+  every legal action is equally likely: fold, call and each raise size. Its
+  play ignores its cards, so its range is every hand compatible with the
+  public cards and ours, whatever it did. Deals and seats are
+  ``RandomOpponent``'s, so ``duplicate`` works the same way.
   """
 
-  def __init__(self, probs, seed: int = 0, duplicate: bool = False) -> None:
+  def __init__(self, probs, seed: int = 0, duplicate: bool = False, raise_step: int = 1,
+               raise_floor: str = "min") -> None:
     super().__init__(np.zeros(0), seed, duplicate)
-    self.probs = np.asarray(probs, np.float64)
+    self.probs = None if probs is None else np.asarray(probs, np.float64)
+    self.raise_step, self.raise_floor = int(raise_step), raise_floor
+
+  def raise_sizes(self, g: RealGame, seat: int) -> np.ndarray | None:
+    return raise_sizes(g, seat, self.raise_step, self.raise_floor)
 
   def type_probs(self, g: RealGame, seat: int) -> np.ndarray:
     """(fold, call, raise) probabilities of ``seat``'s next action in ``g``."""
-    valid = np.array([g.call_amount(seat) > 0, True, raise_range(g, seat) is not None])
-    p = self.probs * valid
+    sizes = self.raise_sizes(g, seat)
+    n = 0 if sizes is None else len(sizes)
+    valid = np.array([g.call_amount(seat) > 0, True, n > 0])
+    weights = np.array([1.0, 1.0, n]) if self.probs is None else self.probs
+    p = weights * valid
     return p / p.sum()
 
   def _bot_moves(self):
@@ -434,8 +457,10 @@ class ChumpOpponent(RandomOpponent):
       elif kind == 1:
         tok = "c" if g.call_amount(bot) > 0 else "k"
       else:
-        lo, hi = raise_range(g, bot)
-        tok = f"b{int(self.rng.integers(lo, hi + 1))}"
+        sizes = self.raise_sizes(g, bot)
+        # The index draws as ``integers(lo, hi + 1)`` did, so the default
+        # chump replays the runs from before ``raise_sizes``.
+        tok = f"b{int(sizes[self.rng.integers(0, len(sizes))])}"
       self._apply(tok)
     return self._response()
 

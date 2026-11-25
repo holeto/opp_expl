@@ -11,3 +11,4 @@ Details: `notes/br_against_slumbot.md`, section "2026-11-19: LBR against the chu
 
 - Only 1/2 call 1/2 raise fcpa is within noise. Our 1/2 call 1/2 raise fc values look swapped against the paper's 1-4 / 3-4 rows (ours 17.9 / 7.2, paper 7.1 / 16.2). Unresolved.
 - The always-call fcpa 1-4 cell (34.7 ± 1.0, paper 34.0 ± 0.5) is in `2026-11-19_lbr_100k`.
+- **Update 2026-11-24:** the paper's random chump is uniform over every legal action (each raise size one action), not 1/3 per action type; that chump matches all four cells. Raises in big blinds change nothing. See `2026-11-24_lbr_chumps_bb`.
