@@ -6,11 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PhD research code on opponent exploitation in imperfect-information games. Pure-JAX
 environments plus a public-state CFR solver built on them. Early stage: the env layer
-(`oppex.envs`: HUNL, Goofspiel), a preflop push-fold CFR solver (`oppex.cfr`) with
+(`oppex.envs`: HUNL, Goofspiel, Leduc), a preflop push-fold CFR solver (`oppex.cfr`) with
 matrix-valued depth-limit leaves, and a policy-gradient baseline
 (`oppex.policy_gradient`: QMMD, ported from the sibling RLG repo, its Slumbot player and
 the blueprint continuations) with exact exploitability for small games (`oppex.tree`)
-exist.
+exist, as do a game-agnostic PSCFR (`oppex.cfr.general`) and safe depth-limited
+re-solving tools on history games (`oppex.tree.public`, `.subgame`, `.cfr`).
 
 ## Commands
 
@@ -365,6 +366,77 @@ blueprint's `π` is known; this needs the unmixed model.
 
 Our-decision terms are near 0, because the re-solved average strategy is almost pure.
 The opponent's terms carry the reduction.
+
+### Subgames with a free opponent and safe re-solving
+
+`cfr_step(..., root_reach=(r0, r1))` starts the poker PSCFR from subgame ranges with
+both players free (also `root_value`, `check_zero_sum`, `exploit.best_response`).
+`Tables.leaf_cfv_sum` / `leaf_mass_sum` average each player's leaf cfv and the
+opponent mass `MASK @ r_opp` with the strategy sum's weights, and
+`average_leaf_cfv` is their ratio: the per-unit value a Resolve gadget offers the
+opponent next. A player's values are averaged in the traversals that update them, so
+a fixed player's stay zero. `scripts/validate_free_subgame.py` checks it.
+
+**General PSCFR** ([src/oppex/cfr/general/](src/oppex/cfr/general/)). A `PublicGame`
+is a tree of public states, each with its own infoset axis per player. Transitions are
+index maps child infoset → parent `(infoset, own action)`; terminals pay through a
+per-state matrix `U[j0, j1]` folded with chance and history incidence (the general
+`MASK`/`EV`); leaves carry `V[t0, t1, j0, j1]`, the incidence `W` and a continuation
+mask. `pscfr.py` is numpy and shares `solver._accumulate`. `from_poker` writes a poker
+tree in this form, and `scripts/validate_general_pscfr.py` requires the two solvers to
+agree table for table **in float64**. In float32 regret matching amplifies summation
+order on leaf trees until the averages differ by 1e-1. The shared update rule is JAX,
+so it truncates to float32 unless a script enables `jax_enable_x64`; the general
+scripts do.
+
+**History games** ([src/oppex/tree/](src/oppex/tree/)). `history_game.HistoryGame` is
+a flat, rewritable history list (chance, decision, terminal, leaf; both players'
+infoset keys at every non-terminal node), built from an extracted tree by
+`from_layered`. `public.py` finds public states by **infoset closure**, which gives
+the common-knowledge partition. It equals the betting-sequence grouping in HUNL but is
+strictly finer than `env.public_state` in Goofspiel: e.g. 1-then-2 losing to 2-then-3
+is common knowledge. `to_public_game` turns any closure-compatible partition into a
+`PublicGame`. `cfr.py` is vanilla history CFR with the same tables. On Goofspiel it is
+3-5× faster than PSCFR. Do not compare free-running CFR trajectories across solvers or
+partitions on Goofspiel: exact ties make a 1e-16 difference flip regret matching. Compare
+one step from shared tables (`goofspiel_cfr_compare.py`) or values under a fixed
+profile (`validate_public_states.py`).
+
+**Exact leaves and the gadget** ([subgame.py](src/oppex/tree/subgame.py)).
+`normal_form_leaves` offers each player every reduced pure strategy below their leaf
+infoset, which makes the depth-limited game equivalent to the full game. A single
+continuation per leaf (`fixed_profile_leaves`) is unsound even with a Nash
+continuation: in Goofspiel 3 the depth-1 root game then accepts the exploitable mix
+(1/3, 0, 2/3). `resolve_gadget` builds the Resolve gadget: chance over root histories by
+chance × resolver reach, then an opponent FOLLOW/TERMINATE choice per root infoset.
+`cut_subgame(..., stop=)` also cuts at nodes a predicate marks (Leduc: the start of
+round 2, whose depth varies). `oppex.tree.resolve` runs either solver on such games
+(`solve_game`), gives the opponent's per-unit best-response values at a gadget's roots
+(`opponent_values`, the CBV alternative values), measures a gadget's safety, and checks that vanilla CFR and PSCFR take
+the same step (`step_disagreement`). `scripts/resolve_goofspiel.py` and
+`scripts/resolve_leduc.py` run nested re-solving end to end. Alternative values that
+are averaged cfvs are only satisfiable once the parent solve has converged. Even
+without exact ties, two free-running CFR solves that differ only in summation order
+drift apart (Leduc root game: 1e-15 after 10 iterations, 3e-4 after 100). On Leduc,
+re-solving round 2 without a gadget from Nash ranges gives NashConv 0.10; with the
+gadget the compound reaches 1.7e-4, but re-solves need several times the root's
+iterations to beat the root-solve strategy. Round-2 equilibria are not unique given
+the ranges, so per-infoset distance to the reference Nash stays about 1% in round 2.
+
+Not yet for poker: board-aware showdowns for postflop subgames, per-card alternative
+values across a street-closing leaf, and `T×T` leaf values for a free opponent.
+
+### Leduc Hold'em ([leduc_holdem.py](src/oppex/envs/leduc_holdem.py))
+
+Ported from another code base: `apply_action` takes no key, and `information_set`
+prepends the seat one-hot (as Goofspiel does) so the two players' keys differ. The
+state holds **ranks** (J, Q, K, two copies each), i.e. OpenSpiel's 6-card Leduc with
+suit isomorphism: 288 acting infosets instead of 936, same value (−0.0856 to player
+0). All three cards are dealt in `init_state`, so an extracted tree has one chance
+root over the 24 rank deals (`env.deal`, probabilities from the 120 card deals) and
+no chance node between the rounds. `src/oppex/envs/leduc_nash.pkl` is an independent
+sequence-form-LP Nash of the 6-card game; `scripts/resolve_leduc.py` reads it (card
+rows merged by rank; they agree to 4e-7) and checks NashConv 1.9e-8 in this env.
 
 ### Env construction
 

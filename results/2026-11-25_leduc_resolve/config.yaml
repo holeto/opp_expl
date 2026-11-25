@@ -1,0 +1,54 @@
+# Configuration of one experiment. command: the CLI call ({seed} is the seed where one exists);
+# resolved_args: every argument after argparse defaults, read off the current CLI.
+# Raw data paths are relative to the project directory.
+experiment: 2026-11-25_leduc_resolve
+question: In Leduc Hold'em, does a depth-limited round-1 solve with exact normal-form leaves, followed by Resolve-gadget re-solves of every reachable round-2 public state, give a compound strategy that converges to a Nash equilibrium, and how does it compare with an independently computed Nash?
+checkpoint: null
+opponent: none (self-play re-solving; both players re-solved)
+reference:
+  source: src/oppex/envs/leduc_nash.pkl, a sequence-form-LP Nash of OpenSpiel's 6-card Leduc, computed outside this code base
+  value: -0.0856064 to player 0 (file); -0.0856064 in our env
+  nash_conv_in_our_env: 1.9e-8 (exact best response)
+  mapping: 936 card-level infosets merged by rank into 288 (largest suit asymmetry 3.7e-7); strategy columns (unused, fold, call, raise)
+agent:
+  type: two-stage safe re-solving
+  settings:
+    game: Leduc Hold'em (oppex.envs.leduc_holdem, rank deck J J Q Q K K, bets 2 and 4, at most 2 raises per round), reward = net chips; all cards dealt at the root (24 rank deals)
+    public_states: infoset closure (oppex.tree.public)
+    root_solve: round 1 from the game root, cut at the first node of round 2 (cut_subgame stop predicate), so the public card is known at each leaf
+    leaves: exact normal-form continuations (normal_form_leaves), 5 reduced pure round-2 strategies for player 0 and 9 for player 1, a 5x9 matrix per leaf history
+    resolves: every round-2 public state (betting line x public card) with joint reach above the threshold (all 15), once per player, to the end of the game
+    gadget: Resolve (resolve_gadget), chance over root histories by chance times the resolver's round-1 reach; TERMINATE pays the opponent's per-unit average leaf cfv from the root solve (main sweep), or its CBV against the root-solve strategy (diagnostic)
+    compound: round 1 from the root solve's average; round 2 from each player's re-solve; the root-solve strategy extends round 1 by the behaviour its leaf mixtures induce
+    solver: alternating DCFR (1.5, 0, 2), same budget for the root solve and every re-solve; the general PSCFR and vanilla history CFR
+    control: reference round 1, round 2 re-solved without a gadget from the reference's ranges, 10000 iterations of vanilla CFR
+    diagnostic: root solve fixed at 1000 PSCFR iterations, re-solves at 1000/3000/10000, averaged cfvs vs CBVs
+    float: float64 (jax_enable_x64)
+code:
+  exact_commit: null
+  after_commit: 1121630
+  uncommitted: src/oppex/cfr/solver.py, src/oppex/cfr/exploit.py, src/oppex/tree/extract.py, src/oppex/envs/__init__.py (modified); src/oppex/envs/leduc_holdem.py (adapted), src/oppex/envs/leduc_nash.pkl, src/oppex/cfr/general/, src/oppex/tree/{cfr,history_game,public,resolve,subgame}.py, scripts/{resolve_leduc,resolve_goofspiel,goofspiel_cfr_compare,validate_free_subgame,validate_general_pscfr,validate_public_states}.py (new)
+  how_known: git rev-parse HEAD and git status --short in the working tree at the start of the run
+jobs:
+- id: null
+  name: local run
+  start: 2026-11-25T13:58:19+01:00
+  end: 2026-11-25T14:35:16+01:00
+  tasks: 1 (completed)
+  state: COMPLETED
+  partition: local (CPU, JAX CPU)
+variants:
+- name: resolve_leduc
+  command: uv run python scripts/resolve_leduc.py
+  seeds: none (deterministic)
+  resolved_args:
+    iters: [10, 30, 100, 300, 1000, 3000]
+    threshold: 0.0
+    check_iters: 3000
+    control_iters: 10000
+    diag_root_iters: 1000
+    diag_iters: [1000, 3000, 10000]
+pooling: none; summary.md copies the numbers printed in run.log
+raw_data:
+  local:
+  - results/2026-11-25_leduc_resolve/run.log

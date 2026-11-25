@@ -1,10 +1,12 @@
 from .base import Env
 from .goofspiel import Goofspiel
 from .hunl_holdem import HunlHoldem
+from .leduc_holdem import LeducHoldem
 
 _REGISTRY: dict[str, type] = {
   "goofspiel": Goofspiel,
   "hunl": HunlHoldem,
+  "leduc": LeducHoldem,
 }
 
 

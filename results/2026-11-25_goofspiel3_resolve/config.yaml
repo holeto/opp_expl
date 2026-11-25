@@ -1,0 +1,47 @@
+# Configuration of one experiment. command: the CLI call ({seed} is the seed where one exists);
+# resolved_args: every argument after argparse defaults, read off the current CLI.
+# Raw data paths are relative to the project directory.
+experiment: 2026-11-25_goofspiel3_resolve
+question: Does nested safe depth-limited re-solving (Resolve gadget, exact normal-form leaves, general public-state CFR) converge to the pure Nash equilibrium of Goofspiel 3 with descending prizes, starting from the uniform strategy?
+checkpoint: null
+opponent: none (self-play re-solving; both players re-solved)
+reference: the pure equilibrium "always play the highest card left" (NashConv 0, checked by the exact best response)
+agent:
+  type: nested re-solving, one public state at a time, top-down
+  settings:
+    game: Goofspiel, 3 cards, prizes 3, 2, 1 in that order, reward = score difference
+    public_states: infoset closure (oppex.tree.public), the common-knowledge partition
+    subgame: one turn deep below the public state (cut_subgame depth 1)
+    leaves: exact normal-form continuations (normal_form_leaves), every reduced pure strategy of the player below the leaf infoset
+    root_solve: plain depth-limited solve from the game root
+    gadget: Resolve (resolve_gadget), chance over root histories by chance times resolver's compound reach, TERMINATE pays the opponent's per-unit leaf value averaged over the resolver's parent solve
+    solver: alternating DCFR (1.5, 0, 2) per solve; the general PSCFR, and vanilla history CFR on the same games
+    compound: starts uniform; a public state is re-solved once per player when its joint reach under the compound strategy exceeds the threshold; the resolver's average strategy at the subgame root replaces the compound there
+    float: float64 (jax_enable_x64)
+code:
+  exact_commit: null
+  after_commit: 1121630
+  uncommitted: src/oppex/cfr/solver.py, src/oppex/cfr/exploit.py, src/oppex/tree/extract.py (modified); src/oppex/cfr/general/, src/oppex/tree/{cfr,history_game,public,subgame}.py, scripts/{resolve_goofspiel,goofspiel_cfr_compare,validate_free_subgame,validate_general_pscfr,validate_public_states}.py (new)
+  how_known: git rev-parse HEAD and git status --short in the working tree at the start of the run
+jobs:
+- id: null
+  name: local run
+  start: 2026-11-25T11:36:10+01:00
+  end: 2026-11-25T11:41:57+01:00
+  tasks: 1 (completed)
+  state: COMPLETED
+  partition: local (CPU, 12 cores, JAX CPU)
+variants:
+- name: resolve_goofspiel3
+  command: uv run python scripts/resolve_goofspiel.py
+  seeds: none (deterministic)
+  resolved_args:
+    iters: [10, 30, 100, 300, 1000, 3000]
+    threshold: 0.05
+    leaf_iters: 2000
+    root_iters: [1, 2, 3, 5]
+    stress_iters: 1000
+pooling: none; summary.md copies the numbers printed in run.log
+raw_data:
+  local:
+  - results/2026-11-25_goofspiel3_resolve/run.log

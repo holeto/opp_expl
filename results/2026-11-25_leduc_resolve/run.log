@@ -1,0 +1,36 @@
+Leduc: 2041 histories, 288 acting infosets
+  0. reference: 936 card-level rows merged into 288 infosets (largest suit asymmetry 3.7e-07); value in our env -0.0856064 (file -0.0856064), exact NashConv 1.9e-08
+Depth-limited root game: 361 histories, 120 leaves, 90 leaf infosets, continuations {5} x {9}
+  1. leaf values under the reference vs the full game below: largest error 3.6e-15
+  2. reference in the depth-limited game: value -0.0856064, NashConv 1.9e-08
+  3. depth-limited root solve, 3000 iterations: value -0.0856062 (reference -0.0856064), depth-limited NashConv 3.0e-05, full-game NashConv of the extended strategy 3.0e-05
+  4. vanilla CFR's step vs PSCFR's, 100 steps of DCFR, CFR+ and vanilla CFR on the root game and a 8-history gadget: largest relative error 7.1e-16
+
+Re-solving (root solve of round 1, gadget re-solves of round 2 above reach 0.0, alternating DCFR)
+   iters   solver  root-solve NC  compound NC  resolved  max safety  TV round 1  TV round 2  loss vs ref   time
+      10    PSCFR      7.953e-01    8.751e-01   15/15     +2.42e+00    2.26e-01    2.14e-01    2.226e-01   0.8s
+      10  vanilla      7.953e-01    8.751e-01   15/15     +2.42e+00    2.26e-01    2.14e-01    2.226e-01   0.8s
+      30    PSCFR      1.056e-01    9.869e-02   15/15     +4.41e-01    5.61e-02    8.04e-02    2.550e-02   1.6s
+      30  vanilla      1.056e-01    9.869e-02   15/15     +4.41e-01    5.61e-02    8.04e-02    2.550e-02   2.0s
+     100    PSCFR      1.772e-02    1.661e-02   15/15     +1.36e-01    1.23e-02    2.57e-02    1.261e-03   4.5s
+     100  vanilla      1.768e-02    1.644e-02   15/15     +1.43e-01    1.23e-02    2.52e-02    1.288e-03   5.3s
+     300    PSCFR      3.220e-03    3.788e-03   15/15     +6.93e-02    1.35e-03    1.23e-02    9.391e-05  12.6s
+     300  vanilla      3.526e-03    3.544e-03   15/15     +6.31e-02    1.40e-03    1.21e-02    1.028e-04  18.0s
+    1000    PSCFR      2.711e-04    5.653e-04   15/15     +5.88e-03    4.87e-04    9.18e-03    2.901e-05  51.6s
+    1000  vanilla      2.383e-04    5.620e-04   15/15     +4.66e-03    4.38e-04    8.74e-03    1.038e-05  59.4s
+    3000    PSCFR      2.987e-05    1.674e-04   15/15     +6.66e-04    5.10e-05    1.11e-02    1.234e-06 139.8s
+    3000  vanilla      3.357e-05    1.266e-04   15/15     +5.98e-04    2.82e-05    1.29e-02    2.162e-07 187.2s
+
+Compound NashConv by budget (PSCFR): 10: 8.75e-01, 30: 9.87e-02, 100: 1.66e-02, 300: 3.79e-03, 1000: 5.65e-04, 3000: 1.67e-04
+
+Control: the reference's round 1, round 2 re-solved without a gadget from its ranges (10000 iterations, vanilla CFR): NashConv 1.007e-01, TV round 2 1.80e-02
+
+Alternative values: root solve fixed at 1000 iterations (PSCFR)
+  re-solve it alt values  root-solve NC  compound NC  max safety   time
+         1000        avg      2.711e-04    5.653e-04   +5.88e-03 688.0s
+         1000        cbv      2.711e-04    6.056e-04   +3.14e-03  39.9s
+         3000        avg      2.711e-04    3.029e-04   +5.88e-03  84.0s
+         3000        cbv      2.711e-04    3.096e-04   +1.47e-03  79.9s
+        10000        avg      2.711e-04    2.071e-04   +5.88e-03 267.3s
+        10000        cbv      2.711e-04    2.402e-04   +2.99e-04 264.3s
+All checks passed.

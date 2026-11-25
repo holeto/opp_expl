@@ -30,6 +30,16 @@ the full profile (exploiter average plus fixed opponent). The rows are never
 written back, so they stay bit-identical. At matrix leaves the fixed player has
 a single continuation (see ``leaves.py``).
 
+**Subgames and alternative values.** ``root_reach=(r0, r1)`` starts the
+traversal from given ranges instead of all-ones, so the same solver runs a
+public subgame rooted anywhere, with both players free. Each player's leaf
+cfvs are averaged over iterations next to the strategy sum, with the same
+weights, in ``Tables.leaf_cfv_sum``; ``Tables.leaf_mass_sum`` holds the
+opponent mass ``MASK @ r_opp`` they were measured against. Their ratio,
+``average_leaf_cfv``, is the per-unit value a Resolve gadget offers the
+opponent at the root of the next subgame. A player's values are averaged in the
+traversals that update them, so a fixed player's stay at zero.
+
 Three things here are easy to get subtly wrong, and each has a guard:
 
 **Card removal belongs at terminals, never in reach propagation.** ``r_i[h]`` is
@@ -92,6 +102,8 @@ class Tables(NamedTuple):
   iters: jax.Array       # () int32
   leaf_regret: jax.Array        # (2, n_leaves, n_hands, n_transforms)
   leaf_strategy_sum: jax.Array  # (2, n_leaves, n_hands, n_transforms)
+  leaf_cfv_sum: jax.Array       # (2, n_leaves, n_hands) weighted tau-weighted cfv
+  leaf_mass_sum: jax.Array      # (2, n_leaves, n_hands) weighted MASK @ r_opp
 
 
 class Discount(NamedTuple):
@@ -131,6 +143,7 @@ def init_tables(
   return Tables(
     jnp.zeros(shape, dtype), jnp.zeros(shape, dtype), jnp.int32(0),
     jnp.zeros(leaf_shape, dtype), jnp.zeros(leaf_shape, dtype),
+    jnp.zeros(leaf_shape[:-1], dtype), jnp.zeros(leaf_shape[:-1], dtype),
   )
 
 
@@ -181,7 +194,8 @@ def fix_strategy(
                      f"for {n_t} continuations")
   leaf_regret = tables.leaf_regret.at[player].set(tau)
   leaf_ssum = tables.leaf_strategy_sum.at[player].set(tau)
-  return Tables(regret, ssum, tables.iters, leaf_regret, leaf_ssum)
+  return tables._replace(regret=regret, strategy_sum=ssum, leaf_regret=leaf_regret,
+                         leaf_strategy_sum=leaf_ssum)
 
 
 # ── Strategy ─────────────────────────────────────────────────────────────────
@@ -212,6 +226,17 @@ def _normalise(ssum: jax.Array, legal: jax.Array) -> jax.Array:
   safe = denom + (denom == 0)
   uniform = legal_b / legal.sum(-1)[:, None, None]
   return jnp.where(denom > 0.0, ssum / safe, uniform).astype(ssum.dtype)
+
+
+def average_leaf_cfv(tables: Tables) -> jax.Array:
+  """Per-unit average leaf value of every hand, ``(2, n_leaves, n_hands)``.
+
+  The iteration-averaged cfv divided by the opponent mass it was measured
+  against: the expected chips of holding ``h`` at the leaf, given the
+  opponent's average range there. Zero where the opponent never reached.
+  """
+  mass = tables.leaf_mass_sum
+  return jnp.where(mass > 0.0, tables.leaf_cfv_sum / jnp.where(mass > 0.0, mass, 1.0), 0.0)
 
 
 def _flat_leaf(x: jax.Array) -> jax.Array:
@@ -476,15 +501,21 @@ def _accumulate(regret, delta, ssum, contrib, weight, plus, discount, coef):
   elif discount is not None:
     pos_d, neg_d, _ = coef
     regret = jnp.where(regret > 0.0, regret * pos_d, regret * neg_d)
+  return regret, _accumulate_average(ssum, contrib, weight, discount, coef)
+
+
+def _accumulate_average(ssum, contrib, weight, discount, coef):
+  # The averaging half of `_accumulate`, also used for the leaf values, so
+  # they are weighted exactly like the strategy they are measured under.
   ssum = ssum + weight * contrib
   if discount is not None:
     ssum = ssum * coef[2]
-  return regret, ssum
+  return ssum
 
 
 def _cfr_iteration(
-  tree, tables: Tables, legal, ev, leaf_values, n_hands, update_player, advance,
-  plus, linear, discount,
+  tree, tables: Tables, legal, ev, leaf_values, root_reach, n_hands, update_player,
+  advance, plus, linear, discount,
 ) -> Tables:
   """One traversal, writing back the tables of ``update_player`` (``-1`` = both).
 
@@ -503,8 +534,8 @@ def _cfr_iteration(
   sigma = regret_matching_plus(tables.regret, legal)
   tau = leaf_strategy(tables)
   leaves = Leaves(leaf_values, tau) if len(tree.leaves) else None
-  ones = jnp.ones(n_hands, tables.regret.dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
+  r0, r1 = _root_reach(root_reach, n_hands, tables.regret.dtype)
+  tv = _traverse(tree, sigma, ev, r0, r1, leaves)
 
   dtype = tables.regret.dtype
   t = tables.iters + 1
@@ -536,12 +567,19 @@ def _cfr_iteration(
   # At a leaf both players act, so each gets its own regret against its own
   # tau-weighted value, and its average is weighted by its own reach.
   leaf_regret, leaf_ssum = tables.leaf_regret, tables.leaf_strategy_sum
+  leaf_cfv, leaf_mass = tables.leaf_cfv_sum, tables.leaf_mass_sum
   if leaves is not None:
-    leaf_delta = tv.leaf_q - (tv.leaf_q * tau).sum(-1, keepdims=True)
+    leaf_v = (tv.leaf_q * tau).sum(-1)
+    leaf_delta = tv.leaf_q - leaf_v[..., None]
     leaf_regret, leaf_ssum = _accumulate(
       leaf_regret, leaf_delta, leaf_ssum, tv.leaf_reach[..., None] * tau,
       weight, plus, discount, coef,
     )
+    # The opponent's reach summed over the hands compatible with each own hand:
+    # what the cfv is an expectation over, so their ratio is a per-unit value.
+    mass = tv.leaf_reach[::-1] @ MASK.T
+    leaf_cfv = _accumulate_average(leaf_cfv, leaf_v, weight, discount, coef)
+    leaf_mass = _accumulate_average(leaf_mass, mass, weight, discount, coef)
 
   if update_player != -1:
     # Selecting *after* the transforms, not before: a node the other player owns
@@ -553,18 +591,30 @@ def _cfr_iteration(
     mine_leaf = (jnp.arange(2) == update_player)[:, None, None, None]
     leaf_regret = jnp.where(mine_leaf, leaf_regret, tables.leaf_regret)
     leaf_ssum = jnp.where(mine_leaf, leaf_ssum, tables.leaf_strategy_sum)
+    leaf_cfv = jnp.where(mine_leaf[..., 0], leaf_cfv, tables.leaf_cfv_sum)
+    leaf_mass = jnp.where(mine_leaf[..., 0], leaf_mass, tables.leaf_mass_sum)
 
-  return Tables(regret, ssum, t if advance else tables.iters, leaf_regret, leaf_ssum)
+  return Tables(regret, ssum, t if advance else tables.iters, leaf_regret, leaf_ssum,
+                leaf_cfv, leaf_mass)
 
 
-@partial(jax.jit, static_argnums=(0, 5, 6, 7, 8, 9, 10))
+def _root_reach(root_reach, n_hands, dtype):
+  # The subgame's root ranges, or all-ones for the full game from the deal.
+  if root_reach is None:
+    ones = jnp.ones(n_hands, dtype)
+    return ones, ones
+  r0, r1 = root_reach
+  return jnp.asarray(r0, dtype), jnp.asarray(r1, dtype)
+
+
+@partial(jax.jit, static_argnums=(0, 6, 7, 8, 9, 10, 11))
 def _cfr_iteration_jit(
-  tree_s: _Static, tables, legal, ev, leaf_values, n_hands, update_player, advance,
-  plus, linear, discount,
+  tree_s: _Static, tables, legal, ev, leaf_values, root_reach, n_hands, update_player,
+  advance, plus, linear, discount,
 ):
   return _cfr_iteration(
-    tree_s.value, tables, legal, ev, leaf_values, n_hands, update_player, advance,
-    plus, linear, discount,
+    tree_s.value, tables, legal, ev, leaf_values, root_reach, n_hands, update_player,
+    advance, plus, linear, discount,
   )
 
 
@@ -610,7 +660,7 @@ def _check_scheme(plus, linear, discount):
 def cfr_iteration(
   tree, tables: Tables, legal, ev, n_hands, *, update_player=-1, advance=True,
   plus=False, linear=False, discount: Discount | None = None, jit=True,
-  leaf_values=None,
+  leaf_values=None, root_reach=None,
 ) -> Tables:
   """One CFR traversal over all hands at once, updating ``update_player``.
 
@@ -628,12 +678,13 @@ def cfr_iteration(
 
   ``leaf_values`` is the ``(n_leaves, T, T, n_hands, n_hands)`` payoff tensor of
   the tree's matrix leaves (see ``leaves.py``); it is traced, like ``ev``.
+  ``root_reach=(r0, r1)`` are the root ranges of a subgame, all-ones if omitted.
   """
   if update_player not in (-1, 0, 1):
     raise ValueError(f"update_player must be -1, 0 or 1; got {update_player}")
   _check_scheme(plus, linear, discount)
   check_leaves(tree, leaf_values, tables)
-  args = (tables, legal, ev, leaf_values, int(n_hands), int(update_player),
+  args = (tables, legal, ev, leaf_values, root_reach, int(n_hands), int(update_player),
           bool(advance), bool(plus), bool(linear), discount)
   if not jit:
     return _cfr_iteration(tree, *args)
@@ -643,7 +694,7 @@ def cfr_iteration(
 def cfr_step(
   tree, tables: Tables, legal, ev, n_hands, *, alternating=False,
   plus=False, linear=False, discount: Discount | None = None, jit=True,
-  leaf_values=None, fixed_player: int | None = None,
+  leaf_values=None, fixed_player: int | None = None, root_reach=None,
 ) -> Tables:
   """One full CFR iteration: every player updated exactly once.
 
@@ -669,7 +720,7 @@ def cfr_step(
   """
   _check_scheme(plus, linear, discount)
   common = dict(plus=plus, linear=linear, discount=discount, jit=jit,
-                leaf_values=leaf_values)
+                leaf_values=leaf_values, root_reach=root_reach)
   if fixed_player is not None:
     if fixed_player not in (0, 1):
       raise ValueError(f"fixed_player must be None, 0 or 1; got {fixed_player}")
@@ -687,16 +738,21 @@ def cfr_step(
   )
 
 
-def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32, leaves: Leaves | None = None):
+def root_value(
+  tree, sigma, ev, n_hands, dtype=jnp.float32, leaves: Leaves | None = None,
+  root_reach=None,
+):
   """(value to player 0, value to player 1) in chips, chance constant applied.
 
   ``leaves`` carries the matrix-leaf values and the continuation strategy to
-  play there, typically ``average_leaf_strategy``.
+  play there, typically ``average_leaf_strategy``. With ``root_reach`` the
+  values are weighted by the subgame's root ranges.
   """
   check_leaves(tree, None if leaves is None else leaves.values)
-  ones = jnp.ones(n_hands, dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
-  return tv.cfv0[tree.root].sum() / N_DEALS, tv.cfv1[tree.root].sum() / N_DEALS
+  r0, r1 = _root_reach(root_reach, n_hands, dtype)
+  tv = _traverse(tree, sigma, ev, r0, r1, leaves)
+  return ((r0 * tv.cfv0[tree.root]).sum() / N_DEALS,
+          (r1 * tv.cfv1[tree.root]).sum() / N_DEALS)
 
 
 # ── Invariants ───────────────────────────────────────────────────────────────
@@ -704,6 +760,7 @@ def root_value(tree, sigma, ev, n_hands, dtype=jnp.float32, leaves: Leaves | Non
 
 def check_zero_sum(
   tree, sigma, ev, n_hands, tol=1e-3, dtype=jnp.float32, leaves: Leaves | None = None,
+  root_reach=None,
 ):
   """``Check whether r0 · cfv0(n) + r1 · cfv1(n) == 0`` at every node, including the root.
 
@@ -711,8 +768,8 @@ def check_zero_sum(
   contraction, which nothing else would catch.
   """
   check_leaves(tree, None if leaves is None else leaves.values)
-  ones = jnp.ones(n_hands, dtype)
-  tv = _traverse(tree, sigma, ev, ones, ones, leaves)
+  r0, r1 = _root_reach(root_reach, n_hands, dtype)
+  tv = _traverse(tree, sigma, ev, r0, r1, leaves)
   v0 = (tv.reach0 * tv.cfv0).sum(-1)                      # (n_nodes,)
   v1 = (tv.reach1 * tv.cfv1).sum(-1)
   scale = jnp.maximum(jnp.maximum(jnp.abs(v0), jnp.abs(v1)), 1.0)

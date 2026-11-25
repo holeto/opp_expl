@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from itertools import permutations
+from itertools import permutations, product
 from typing import Any
 
 import numpy as np
@@ -11,6 +11,7 @@ import jax.numpy as jnp
 
 from ..envs.base import Env
 from ..envs.goofspiel import Goofspiel
+from ..envs.leduc_holdem import LeducHoldem
 from .types import (
   EK_CHANCE,
   EK_PLAYER0,
@@ -66,6 +67,8 @@ def _enumerate_initial_states(env: Env) -> list[tuple[Any, float]]:
   """
   if isinstance(env, Goofspiel):
     return _goofspiel_inits(env)
+  if isinstance(env, LeducHoldem):
+    return _leduc_inits(env)
   raise ValueError(
     f"Cannot enumerate initial states for {type(env).__name__}. "
     "Add a case to _enumerate_initial_states."
@@ -79,6 +82,20 @@ def _goofspiel_inits(env: Goofspiel) -> list[tuple[Any, float]]:
   perms = list(permutations(range(1, env.n_cards + 1)))
   prob = 1.0 / len(perms)
   return [(base._replace(prize_deck=jnp.array(p, dtype=jnp.int32)), prob) for p in perms]
+
+
+def _leduc_inits(env: LeducHoldem) -> list[tuple[Any, float]]:
+  # The 24 rank deals (r0, r1, public): 6*5*4 ordered card deals, grouped by
+  # rank. Two copies per rank, so a rank seen k times before has 2 - k left.
+  out = []
+  for deal in product(range(3), repeat=3):
+    ways, seen = 1, []
+    for r in deal:
+      ways *= 2 - seen.count(r)
+      seen.append(r)
+    if ways:
+      out.append((env.deal(deal[:2], deal[2]), ways / 120))
+  return out
 
 
 def _chance_layer(depth: int, num_actions: int) -> GameTreeLayer:
@@ -146,11 +163,16 @@ def _layer_from_states(
   )
 
 
-def extract_game_tree(env: Env) -> LayeredGameTree:
+def extract_game_tree(
+  env: Env, initial_states: list[tuple[Any, float]] | None = None,
+) -> LayeredGameTree:
   """BFS layered game-tree extraction (no cross-branch merging).
 
   Uses fused ``jit(vmap)`` for frontier observations and for ``apply_action``,
   and batched gathers for the next frontier.
+
+  ``initial_states`` overrides the enumerated deals with ``[(state, prob)]``,
+  for a game too large to enumerate, such as HUNL restricted to a few deals.
   """
   layers: list[GameTreeLayer] = []
   transitions: list[LayerTransition] = []
@@ -158,7 +180,8 @@ def extract_game_tree(env: Env) -> LayeredGameTree:
   vm_obs = _make_vm_tree_obs(env)
   vm_apply = _make_vm_tree_apply(env)
 
-  init_states = _enumerate_initial_states(env)
+  init_states = (_enumerate_initial_states(env) if initial_states is None
+                 else initial_states)
   multi_root = not (len(init_states) == 1 and init_states[0][1] >= 1.0 - 1e-9)
 
   depth_cursor = 0

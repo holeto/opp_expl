@@ -47,6 +47,15 @@ Both are inferred from dates. From now on, a run should log `git rev-parse HEAD`
 
 The 100k runs and the LocalSlumbot rows of `2026-11-19_lbr_100k` use seeds 2000–2399. They play the same deals, so they compare deal by deal.
 
+## Experiments: safe depth-limited re-solving
+
+These commands are in `scripts/` rather than `scripts/policy_gradient/`.
+
+| Folder | What | Headline |
+|---|---|---|
+| `2026-11-25_goofspiel3_resolve` | nested Resolve-gadget re-solving on Goofspiel 3 (descending), exact normal-form leaves, from uniform | compound NashConv 1.2e-2 at 10 iterations per solve, 5.0e-10 at 3000 (pure Nash: 0) |
+| `2026-11-25_leduc_resolve` | Leduc: round-1 solve with normal-form leaves, Resolve-gadget re-solves of all round-2 states, vs an LP Nash | compound NashConv 0.88 at 10 iterations per solve, 1.7e-4 at 3000; loses 1.2e-6 chips to the reference; no-gadget control 0.10 |
+
 ## Seeds
 
 `seeds` and `hands_per_seed` mean one run per seed, each playing that many hands. A seed does not fix one deal for all its hands:
