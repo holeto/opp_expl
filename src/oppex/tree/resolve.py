@@ -23,17 +23,19 @@ from .public import leaf_rows_by_key, rows_from_strategies, strategies_from_rows
 from .subgame import resolve_gadget
 
 
-def solve_game(game: HistoryGame, iters: int, use_pscfr: bool, scheme: dict):
+def solve_game(game: HistoryGame, iters: int, use_pscfr: bool, scheme: dict, fixed=None):
   """Solve ``game`` for ``iters`` iterations of ``scheme``.
 
   Returns ``(strategies, values, leaf_tau)``: the average behaviour strategy
   per player as ``{key: probs}``, and per leaf infoset ``(player, key)`` the
   per-unit average leaf value (``average_leaf_cfv``) and the average
-  continuation mixture.
+  continuation mixture. ``fixed`` (``{(player, key): probs}``, PSCFR only)
+  freezes those infosets, as for the known model in RNR.
   """
+  assert use_pscfr or not fixed, "frozen rows are implemented for PSCFR only"
   if use_pscfr:
     pg = to_public_game(game)
-    tab = pscfr.solve(pg, iters, **scheme)
+    tab = pscfr.solve(pg, iters, fixed=fixed, **scheme)
     sig, tau = pscfr.average_strategy(pg, tab)
     rows = leaf_rows_by_key(pg)
     strat = strategies_from_rows(pg, sig)

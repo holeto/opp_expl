@@ -1,0 +1,60 @@
+# Configuration of one experiment. command: the CLI call ({seed} is the seed where one exists);
+# resolved_args: every argument after argparse defaults, read off the current CLI.
+# Raw data paths are relative to the project directory.
+experiment: 2026-11-26_rnr_leduc_chump
+question: Does depth-limited RNR (round-1 RNR solve with exact normal-form leaves, then RNR re-solves of every round-2 public state in a gadget with Resolve weights for the unknown branch) reproduce the full-game RNR trade-off against the chump model in Leduc, and does re-solving keep the RNR objective of its parent?
+checkpoint: null
+opponent: always call (check when nobody has bet), both seats
+reference:
+  source: full-game RNR at the same p (ground truth, computed in the run); exact best response to the model (p = 1); src/oppex/envs/leduc_nash.pkl (game value -0.0856064, used for exploitability and the model)
+agent:
+  type: depth-limited restricted Nash response (RNR) with safe re-solving, general PSCFR only
+  settings:
+    game: Leduc Hold'em (oppex.envs.leduc_holdem), all cards dealt at the root (24 rank deals)
+    rnr_game: oppex.tree.rnr.rnr_game; one chance root over (branch, deal) with weights p and 1-p; our infosets shared by both branches, the opponent's tagged ("known", key) in the known copy and frozen at the model (pscfr.fix_rows)
+    root_solve: RNR game of round 1, cut at the first node of round 2, exact normal-form leaves (5x9); known-copy leaves value each of our continuations against the model (one opponent column); 1000 iterations
+    parent: root-solve average in round 1 plus the behaviour its leaf mixtures induce in round 2
+    resolves: every round-2 public state with positive weight in either branch, for the exploiter's seat, to the end of the game, in rnr_gadget; 3000 iterations
+    gadget_weights: known roots p*c*pi_i*pi_fix; unknown roots (1-p)*c*pi_i (variant B) or that times the parent's free-opponent reach (variant A); one normalisation over both branches; known roots pass through a FOLLOW-only node
+    alt_values: CBV of the free opponent against the parent (opponent_values), or its averaged leaf cfv from the root solve (avg)
+    variants: B+cbv (main) at every p; B+avg and A+cbv at p = 0.1 and 0.5
+    seats: the exploiter in each seat separately, the model in the other
+    ground_truth: full-game RNR (rnr_game on the full tree, no depth limit), 3000 PSCFR iterations
+    metrics: per seat and mean over seats; value against the model; worst-case value (exact best response); exploitability of our strategy alone = seat game value - worst case (game value -0.0856064 to player 0); RNR objective F = p*vs_model + (1-p)*worst
+    solver: alternating DCFR (1.5, 0, 2), float64
+    derivation: notes/rnr_resolve_derivation.md
+code:
+  exact_commit: null
+  after_commit: 297964b
+  uncommitted: src/oppex/cfr/general/pscfr.py, src/oppex/tree/resolve.py (modified, frozen rows); src/oppex/tree/rnr.py, scripts/rnr_leduc.py (new)
+  how_known: git rev-parse HEAD and git status --short in the working tree at the start of the run
+jobs:
+- id: null
+  name: local run
+  start: 2026-11-26T12:45:46+01:00
+  end: 2026-11-26T13:00:04+01:00
+  tasks: 1 (completed, exit 0)
+  state: COMPLETED
+  partition: local (12th Gen Intel i5-12450H, 12 threads, WSL2; JAX on CPU)
+runtime:
+  wall_time: 14 min 18 s
+  per_part: in run.log, column time (seconds per p and variant, both seats; full-game RNR and walks separately)
+  hardware: local laptop CPU, numpy and JAX on CPU, single process
+  how_known: start/end timestamps written to the log by the shell, per-row times printed by the script
+variants:
+- name: rnr_leduc_chump
+  command: uv run python scripts/rnr_leduc.py --model chump
+  seeds: none (deterministic)
+  resolved_args:
+    model: chump
+    perturb: 0.5
+    p: [0.0, 1.0, 0.1, 0.5]
+    root_iters: 1000
+    iters: 3000
+    truth_iters: 3000
+    br_tol: 0.0001
+    monotone_tol: 0.001
+pooling: none; summary.md copies the numbers printed in run.log
+raw_data:
+  local:
+  - results/2026-11-26_rnr_leduc_chump/run.log

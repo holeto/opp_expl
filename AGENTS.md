@@ -423,6 +423,20 @@ gadget the compound reaches 1.7e-4, but re-solves need several times the root's
 iterations to beat the root-solve strategy. Round-2 equilibria are not unique given
 the ranges, so per-infoset distance to the reference Nash stays about 1% in round 2.
 
+**RNR** ([rnr.py](src/oppex/tree/rnr.py)). The restricted Nash response as a history
+game: one chance root over (branch, deal), our infosets shared by both branches, the
+opponent's tagged `("known", key)` in the known copy and frozen at the model through
+`pscfr.fix_rows` / `solve(..., fixed=)` (not chance nodes: they share public states with the
+free opponent's decisions). `rnr_gadget` re-solves a public state with the known copy of all
+its histories (weights p·c·π_i·π_fix, a FOLLOW-only pass-through node) and the Resolve
+gadget over the unknown copy with weights (1−p)·c·π_i. That weighting lower-bounds the
+RNR objective, so with CBV alternative values re-solving keeps the parent's objective
+(derivation in `notes/rnr_resolve_derivation.md`); weighting by the parent's free reach
+instead has no such bound and measurably loses. `scripts/rnr_leduc.py` checks p = 0
+(bit-identical to `resolve_walk`) and p = 1 (best response to the model), and compares
+with the full-game RNR. Report the exploitability of our strategy alone, never the NashConv
+of us and the model.
+
 Not yet for poker: board-aware showdowns for postflop subgames, per-card alternative
 values across a street-closing leaf, and `T×T` leaf values for a free opponent.
 

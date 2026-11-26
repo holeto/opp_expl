@@ -55,6 +55,8 @@ These commands are in `scripts/` rather than `scripts/policy_gradient/`.
 |---|---|---|
 | `2026-11-25_goofspiel3_resolve` | nested Resolve-gadget re-solving on Goofspiel 3 (descending), exact normal-form leaves, from uniform | compound NashConv 1.2e-2 at 10 iterations per solve, 5.0e-10 at 3000 (pure Nash: 0) |
 | `2026-11-25_leduc_resolve` | Leduc: round-1 solve with normal-form leaves, Resolve-gadget re-solves of all round-2 states, vs an LP Nash | compound NashConv 0.88 at 10 iterations per solve, 1.7e-4 at 3000; loses 1.2e-6 chips to the reference; no-gadget control 0.10 |
+| `2026-11-26_rnr_leduc_chump` | Leduc: depth-limited RNR (round-1 solve + RNR gadget re-solves of round 2) vs always-call chump, p = 0, 0.1, 0.5, 1 | p = 0.1: wins 1.079 (Nash 0.645, BR 1.467) at exploitability 0.010; F within 2.5e-4 of full-game RNR at every p |
+| `2026-11-26_rnr_leduc_perturbed` | same vs the LP Nash with half its round-2 folds turned into calls | p = 0.1: wins 0.117 (Nash 0.098, BR 0.560) at exploitability 6.5e-4; F within 1.7e-4 of full-game RNR at every p |
 
 ## Seeds
 

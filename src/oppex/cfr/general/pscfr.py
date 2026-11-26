@@ -117,6 +117,27 @@ def average_strategy(game, tables):
           _normalise(tables.leaf_strategy_sum, lay.t_legal))
 
 
+def fix_rows(game: PublicGame, tables: Tables, fixed: dict) -> tuple[Tables, np.ndarray]:
+  """Freeze the rows of ``fixed`` (``{(player, key): probs}``) at those strategies.
+
+  As ``solver.fix_strategy``: the strategy goes into the regret and the
+  strategy-sum rows. Regret matching returns a normalised non-negative vector
+  unchanged, and ``cfr_iteration(..., frozen=)`` never writes these rows back,
+  so the current and the average strategy there stay ``probs``. This is how a
+  known opponent model plays next to free infosets of the same player (RNR).
+  Returns the tables and the ``(R,)`` frozen-row mask.
+  """
+  lay = layout(game)
+  regret, ssum = tables.regret.copy(), tables.strategy_sum.copy()
+  frozen = np.zeros(regret.shape[0], bool)
+  for (s, p), lo in lay.rows.items():
+    for j, k in enumerate(game.states[s].keys[p]):
+      if (p, k) in fixed:
+        regret[lo + j] = ssum[lo + j] = np.asarray(fixed[(p, k)], regret.dtype)
+        frozen[lo + j] = True
+  return tables._replace(regret=regret, strategy_sum=ssum), frozen
+
+
 def average_leaf_cfv(tables) -> np.ndarray:
   """Per-unit average leaf value of every leaf infoset, ``(RL,)``; 0 where unreached."""
   m = tables.leaf_mass_sum
@@ -212,8 +233,11 @@ def _coef(t, dtype, linear, discount):
 
 
 def cfr_iteration(game, tables: Tables, *, update_player=-1, advance=True, plus=False,
-                  linear=False, discount: Discount | None = None) -> Tables:
-  """One traversal, writing back ``update_player``'s rows (``-1`` = both)."""
+                  linear=False, discount: Discount | None = None, frozen=None) -> Tables:
+  """One traversal, writing back ``update_player``'s rows (``-1`` = both).
+
+  Rows marked in ``frozen`` (see ``fix_rows``) are never written back.
+  """
   lay = layout(game)
   sigma, tau = current_strategy(game, tables)
   tv = traverse(game, sigma, tau)
@@ -263,23 +287,34 @@ def cfr_iteration(game, tables: Tables, *, update_player=-1, advance=True, plus=
     l_ssum = np.where(lmine[:, None], l_ssum, tables.leaf_strategy_sum)
     l_cfv = np.where(lmine, l_cfv, tables.leaf_cfv_sum)
     l_mass = np.where(lmine, l_mass, tables.leaf_mass_sum)
+  if frozen is not None:
+    regret = np.where(frozen[:, None], tables.regret, regret)
+    ssum = np.where(frozen[:, None], tables.strategy_sum, ssum)
   return Tables(regret, ssum, t if advance else tables.iters, l_regret, l_ssum, l_cfv, l_mass)
 
 
 def cfr_step(game, tables: Tables, *, alternating=False, plus=False, linear=False,
-             discount: Discount | None = None) -> Tables:
+             discount: Discount | None = None, frozen=None) -> Tables:
   """One full iteration, with ``solver.cfr_step``'s two schedules."""
-  kw = dict(plus=plus, linear=linear, discount=discount)
+  kw = dict(plus=plus, linear=linear, discount=discount, frozen=frozen)
   if not alternating:
     return cfr_iteration(game, tables, **kw)
   tables = cfr_iteration(game, tables, update_player=0, advance=False, **kw)
   return cfr_iteration(game, tables, update_player=1, **kw)
 
 
-def solve(game, iters, **scheme) -> Tables:
-  tables = init_tables(game)
+def solve(game, iters, fixed=None, **scheme) -> Tables:
+  """``iters`` iterations from zero tables; ``fixed`` rows are frozen (``fix_rows``)."""
+  tables, frozen = init_tables(game), None
+  if fixed:
+    tables, frozen = fix_rows(game, tables, fixed)
+    start = tables
   for _ in range(iters):
-    tables = cfr_step(game, tables, **scheme)
+    tables = cfr_step(game, tables, frozen=frozen, **scheme)
+  if frozen is not None:
+    assert (np.array_equal(tables.regret[frozen], start.regret[frozen])
+            and np.array_equal(tables.strategy_sum[frozen], start.strategy_sum[frozen])), \
+      "a frozen row changed"
   return tables
 
 
